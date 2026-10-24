@@ -1,3 +1,15 @@
+# YunoHost Backup Manager **0.5~ynh25**
+
+## Zmiany w 0.5~ynh25 — zwarty, subtelny panel
+
+- Zmniejszone przyciski, pola formularzy, odstępy, nagłówki, tabele i pasek nawigacyjny.
+- Bardziej stonowane kolory akcji drugorzędnych i usuwania.
+- Zwarte paski postępu, tabele fragmentów i okna z logami.
+- Dostosowanie do urządzeń mobilnych; formularze pozostają wygodne w obsłudze dotykowej.
+- Bez zmian w logice wykonywania, przywracania, planowania, sprzątania i aktualizacji kopii.
+
+---
+
 # YunoHost Backup Manager **0.5~ynh24**
 
 ## Nowe w 0.5~ynh24
