@@ -1,6 +1,25 @@
-# YunoHost Backup Manager — 0.5~ynh10 (wersja testowa)
+# YunoHost Backup Manager — 0.5~ynh11 (wersja testowa)
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh10**
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh11**
+
+## Zmiany w 0.5~ynh11
+
+1. **Ikona YunoHost:** pliki `icon.png` i `doc/logo.png` znajdują się w repozytorium; skrypty instalacji i aktualizacji rejestrują ikonę w uprawnieniu `yunohost-backup-manager.main` przez oficjalne polecenie YunoHost. Ikona jest także widoczna w nagłówku panelu aplikacji.
+2. **Ścieżka magazynu:** lista magazynów i wybór miejsca docelowego pokazują `Udział/Podkatalog`, np. `Archiwum/yunohost` (o ile podkatalog jest podany).
+3. **Postęp importu:** przy imporcie listy aplikacji z JSON panel wyświetla animowany pasek pracy i log rzeczywistych etapów (liczba wczytanych wpisów, walidacja na serwerze, wynik, odświeżenie). Bez fikcyjnego procentu.
+4. **Rozpoznawalna nazwa archiwum:** nowo tworzone archiwa YunoHost zawierają czytelne nazwy wybranych aplikacji, datę oraz krótki identyfikator unikatowy, np. `ybm_Balchan-KGW_20261024_061000_9a5c32.tar`. Nazwy są pobierane z listy aplikacji YunoHost; identyfikatory aplikacji zapisuje również plik metadanych `.info.json`. Długie listy otrzymują skróconą nazwę z liczbą dodatkowych aplikacji i sumą kontrolną. Plik `.info.json` ma taką samą nazwę bazową.
+
+**Dotychczasowe archiwa pozostają bez zmian.** Dane magazynów i hasła nie są usuwane podczas aktualizacji.
+
+### Aktualizacja
+
+Rozpakuj ZIP i wgraj wszystkie jego pliki do głównego katalogu repozytorium `https://github.com/ToPola0/yunohost-backup-manager_ynh` (gałąź `main`). Następnie w panelu aplikacji wybierz **Sprawdź aktualizacje → Aktualizuj aplikację**.
+
+Żadna poprawka nie wymaga ręcznych zmian w konfiguracji YunoHost, Proxmox, OMV ani Tailscale. Skrypty pakietu modyfikują jedynie zasoby i metadane własnej aplikacji w ramach standardowej instalacji/aktualizacji YunoHost.
+
+---
+
+## Poprzednie zmiany
 
 ## Co nowego w 0.5~ynh10
 

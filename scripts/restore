@@ -15,3 +15,9 @@ ynh_config_add_systemd
 systemctl daemon-reload
 systemctl enable "$app"
 systemctl restart "$app"
+# Set only this app's logo in the YunoHost application/permission metadata.
+# This is optional presentation metadata, never a reason to fail an app upgrade.
+if ! yunohost user permission update "${app}.main" --logo "$install_dir/logo.png"; then
+    echo "UWAGA: YunoHost nie zaktualizował ikony tej aplikacji." >&2
+fi
+

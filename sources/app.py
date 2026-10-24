@@ -18,6 +18,7 @@ import hashlib
 import time
 import hmac
 import secrets
+import unicodedata
 from updater import APP_VERSION, check_remote, read_state, write_state, read_log_chunk, LOG_FILE
 
 app = Flask(__name__)
@@ -356,6 +357,26 @@ class HashWriter:
         return len(chunk)
 
 
+def backup_archive_name(app_ids, app_names=None):
+    """Use recognizable YunoHost app labels, IDs and time in archive filenames."""
+    labels = app_names if app_names and len(app_names) == len(app_ids) else app_ids
+    safe_labels = []
+    for label, app_id in zip(labels, app_ids):
+        text = unicodedata.normalize('NFKD', label.replace('ł', 'l').replace('Ł', 'L'))
+        text = text.encode('ascii', 'ignore').decode('ascii')
+        text = re.sub(r'[^A-Za-z0-9_-]+', '-', text).strip('-_')
+        if not text:
+            text = re.sub(r'[^A-Za-z0-9_-]+', '-', app_id).strip('-_') or 'app'
+        safe_labels.append(text)
+    description = '-'.join(safe_labels)
+    if len(description) > 70:
+        checksum = hashlib.sha256('\x00'.join(app_ids).encode('utf-8')).hexdigest()[:10]
+        first = safe_labels[0][:40].rstrip('-_') or 'app'
+        description = f'{first}-plus{len(app_ids)-1}-{checksum}'
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    return f'ybm_{description}_{timestamp}_{uuid.uuid4().hex[:6]}'
+
+
 def file_hash(path):
     digest = hashlib.sha256()
     with path.open('rb') as f:
@@ -413,7 +434,7 @@ def transfer_modern(cfg, files):
                 pass
 
 
-def backup_worker(app_ids, storage_id):
+def backup_worker(app_ids, storage_id, app_names):
     try:
         BACKUP_STATE.update(status='running', message='Sprawdzanie miejsca...', details=[])
         # Zapobiegamy przepełnieniu dysku: zapas 1 GiB ponad szacowaną wielkość.
@@ -428,8 +449,8 @@ def backup_worker(app_ids, storage_id):
         if free < estimated + 1024 ** 3:
             raise RuntimeError('Za mało wolnego miejsca na kopię lokalną.')
         cfg = cfg_from_storage(storage_id)
-        name = 'ybm_' + time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:8]
-        BACKUP_STATE['message'] = 'Tworzenie lokalnej kopii YunoHost...'
+        name = backup_archive_name(app_ids, app_names)
+        BACKUP_STATE['message'] = 'Tworzenie archiwum ' + name + ' dla aplikacji: ' + ', '.join(app_names)
         # Używamy jednej kopii z wybranymi aplikacjami.
         yn_command('backup', 'create', '--apps', *app_ids, '--name', name)
         files = [BACKUP_DIR / (name + '.tar'), BACKUP_DIR / (name + '.info.json')]
@@ -452,7 +473,7 @@ def backup_worker(app_ids, storage_id):
         BACKUP_STATE['message'] = 'Weryfikacja zakończona. Usuwanie lokalnej kopii...'
         yn_command('backup', 'delete', name, timeout=120)
         BACKUP_STATE.update(status='success', message='Kopia ' + name + ' przesłana i zweryfikowana. Lokalna usunięta.',
-                            details=[f.name for f in files])
+                            details=['Aplikacje: ' + ', '.join(f'{n} ({i})' for n, i in zip(app_names, app_ids))] + [f.name for f in files])
     except Exception as exc:
         BACKUP_STATE.update(status='error',
                             message=str(exc) + ' Kopia lokalna, jeśli powstała, nie została celowo usunięta.')
@@ -474,7 +495,8 @@ def backup_start():
     storage_id = payload.get('storage', '')
     if not isinstance(app_ids, list) or not app_ids or len(app_ids) > 100:
         return jsonify(success=False, message='Wybierz aplikacje.'), 400
-    valid = {app['id'] for app in actual_apps()}
+    app_labels = {app['id']: app['name'] for app in actual_apps()}
+    valid = set(app_labels)
     if any(not isinstance(a, str) or a not in valid for a in app_ids):
         return jsonify(success=False, message='Nieprawidłowa lista aplikacji.'), 400
     if not isinstance(storage_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,49}', storage_id):
@@ -484,7 +506,7 @@ def backup_start():
     if not BACKUP_LOCK.acquire(blocking=False):
         return jsonify(success=False, message='Kopia już trwa.'), 409
     BACKUP_STATE.update(status='running', message='Rozpoczynanie...', details=[])
-    threading.Thread(target=backup_worker, args=(app_ids, storage_id), daemon=True).start()
+    threading.Thread(target=backup_worker, args=(app_ids, storage_id, [app_labels[a] for a in app_ids]), daemon=True).start()
     return jsonify(success=True, message='Rozpoczęto wykonywanie kopii.')
 
 
@@ -639,9 +661,14 @@ textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border
 #updateLogPanel .actions{margin:0;padding:8px 10px;background:#f1f5fa}
 #updateLogPanel .actions button{padding:7px 12px;font-size:12px}
 #updateLogPanel[hidden],#updateProgress[hidden]{display:none}
-</style></head><body><header style="display:flex;align-items:center;gap:12px"><img id="appLogo" alt="" width="48" height="48" style="border-radius:9px;object-fit:contain"><span>YunoHost Backup Manager <small style="color:#cad5e5">0.5~ynh10</small></span></header><main>
+#importProgress{margin-top:18px}
+#importLogPanel{margin-top:14px;border:1px solid #d8e0eb;border-radius:7px;overflow:hidden}
+#importLogPanel summary{cursor:pointer;user-select:none;padding:12px 14px;font-weight:600;background:#f1f5fa;color:#334d71}
+#importLogPanel pre{font:12px/1.55 Consolas,'Liberation Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:240px;min-height:65px;margin:0;padding:14px;color:#d8e7ff;background:#142136}
+#importLogPanel[hidden],#importProgress[hidden]{display:none}
+</style></head><body><header style="display:flex;align-items:center;gap:12px"><img id="appLogo" alt="" width="48" height="48" style="border-radius:9px;object-fit:contain"><span>YunoHost Backup Manager <small style="color:#cad5e5">0.5~ynh11</small></span></header><main>
 <section class="panel" id="updatePanel"><h2>Aktualizacje aplikacji</h2>
-<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh10</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
+<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh11</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
 <div id="updateMessage" class="message" style="display:none"></div>
 <div class="actions"><button type="button" id="checkUpdate" class="secondary">Sprawdź aktualizacje</button><button type="button" id="startUpdate" disabled>Aktualizuj aplikację</button></div>
 <div id="updateProgress" hidden>
@@ -673,7 +700,12 @@ textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border
 <details style="margin-top:22px"><summary>Importuj listę aplikacji z YunoHost (tryb lokalny)</summary>
 <p><small>Wklej wynik polecenia <code>yunohost app list --output-as json</code>. Nie podawaj haseł.</small></p>
 <textarea id="appsJson" placeholder='{"apps":[{"id":"wordpress","name":"Bałchan","domain_path":"strona.rpkj.ovh/organypiszczalkowe"}]}'></textarea>
-<div class="actions"><button type="button" id="importApps">Importuj aplikacje</button></div></details>
+<div class="actions"><button type="button" id="importApps">Importuj aplikacje</button></div>
+<div id="importProgress" hidden>
+  <div class="update-progress-caption"><strong id="importStage">Importowanie aplikacji</strong><span id="importPhase">Przygotowanie danych…</span></div>
+  <div id="importTrack" class="update-track" role="progressbar" aria-label="Stan importu" aria-valuetext="Trwa import"><span class="update-progress-fill"></span></div>
+</div>
+<details id="importLogPanel" hidden open><summary>Podgląd przebiegu importu</summary><pre id="importLogText" role="log" aria-label="Log importu"></pre></details></details>
 <div id="appsMessage" class="message"></div><div id="backupMessage" class="message"></div></section>
 </main><script>
 const $=id=>document.getElementById(id);let editing=null;let records=[];
@@ -682,8 +714,9 @@ function msg(ok,s){$('message').style.display='block';$('message').className='me
 function data(){return Object.fromEntries(new FormData($('form')))}
 async function api(url,method='GET',payload){const base=window.location.pathname.replace(/\/$/,'');const r=await fetch(base+url,{method,headers:{'Content-Type':'application/json'},body:payload?JSON.stringify(payload):undefined});return await r.json()}
 function busy(v){for(const x of ['discover','test','save'])$(x).disabled=v}
+function storageLocation(m){return m.share+(m.subdirectory?'/'+m.subdirectory.replace(/^\/+|\/+$/g,''):'')}
 function reset(){editing=null;$('form').reset();$('id').disabled=false;$('password').required=true;$('formTitle').textContent='Dodaj magazyn SMB/CIFS';$('cancel').hidden=true;$('share').innerHTML='<option value="">Najpierw pobierz udziały</option>'}
-async function refresh(){const x=await api('/api/magazyny');records=x.magazyny||[];const storage=$('backupStorage');const selected=storage.value;storage.replaceChildren(new Option('Wybierz magazyn',''));for(const m of records)storage.add(new Option(m.id+' ('+m.server+'/'+m.share+')',m.id));storage.value=selected;const tbody=$('rows');tbody.replaceChildren();if(!records.length){const tr=tbody.insertRow();const td=tr.insertCell();td.colSpan=5;td.textContent='Brak zapisanych magazynów.';return}for(const m of records){const tr=tbody.insertRow();for(const v of [m.id,m.server,m.share,m.protocol==='auto'?'Auto':m.protocol.toUpperCase()])tr.insertCell().textContent=v;const td=tr.insertCell();for(const [title,fn,danger] of [['Edytuj',()=>edit(m.id),false],['Usuń',()=>remove(m.id),true]]){const b=document.createElement('button');b.textContent=title;b.className=danger?'danger':'secondary';b.onclick=fn;td.appendChild(b)}}}
+async function refresh(){const x=await api('/api/magazyny');records=x.magazyny||[];const storage=$('backupStorage');const selected=storage.value;storage.replaceChildren(new Option('Wybierz magazyn',''));for(const m of records)storage.add(new Option(m.id+' ('+m.server+'/'+storageLocation(m)+')',m.id));storage.value=selected;const tbody=$('rows');tbody.replaceChildren();if(!records.length){const tr=tbody.insertRow();const td=tr.insertCell();td.colSpan=5;td.textContent='Brak zapisanych magazynów.';return}for(const m of records){const tr=tbody.insertRow();for(const v of [m.id,m.server,storageLocation(m),m.protocol==='auto'?'Auto':m.protocol.toUpperCase()])tr.insertCell().textContent=v;const td=tr.insertCell();for(const [title,fn,danger] of [['Edytuj',()=>edit(m.id),false],['Usuń',()=>remove(m.id),true]]){const b=document.createElement('button');b.textContent=title;b.className=danger?'danger':'secondary';b.onclick=fn;td.appendChild(b)}}}
 function edit(id){const m=records.find(x=>x.id===id);if(!m)return;editing=id;for(const k of ['id','server','username','domain','protocol','subdirectory'])$(k).value=m[k]||'';$('id').disabled=true;$('password').value='';$('password').required=false;$('share').replaceChildren(new Option(m.share,m.share));$('formTitle').textContent='Edytuj magazyn: '+id;$('cancel').hidden=false;msg(true,'Edytujesz magazyn. Puste hasło zachowa poprzednie.');$('form').scrollIntoView({behavior:'smooth'})}
 async function remove(id){if(!confirm('Usunąć magazyn '+id+'?'))return;const x=await api('/api/magazyny/'+encodeURIComponent(id),'DELETE');msg(x.success,x.message);if(x.success){if(editing===id)reset();await refresh()}}
 $('cancel').onclick=()=>{reset();msg(true,'Anulowano edycję.')};
@@ -700,10 +733,35 @@ async function refreshApps(){
  const desc=document.createElement('span');const title=document.createElement('strong');title.textContent=a.name+' ('+a.id+')';
  const path=document.createElement('small');path.textContent=a.domain_path;desc.append(title,path);line.append(cb,desc);host.appendChild(line)}
 }
-$('importApps').onclick=async()=>{const output=$('appsMessage');output.style.display='block';
- try{const input=JSON.parse($('appsJson').value);const result=await api('/api/aplikacje/import','POST',input);
- output.className='message '+(result.success?'ok':'error');output.textContent=result.message;if(result.success)await refreshApps()}
- catch(e){output.className='message error';output.textContent='Nieprawidłowy JSON: '+e.message}};
+$('importApps').onclick=async()=>{
+ const output=$('appsMessage'), button=$('importApps'), progress=$('importProgress'), track=$('importTrack');
+ const log=$('importLogText'), phase=$('importPhase'), stage=$('importStage');
+ if(button.disabled)return;
+ button.disabled=true;progress.hidden=false;$('importLogPanel').hidden=false;$('importLogPanel').open=true;
+ track.className='update-track';track.setAttribute('aria-valuetext','Trwa import');
+ stage.textContent='Importowanie aplikacji';phase.textContent='Sprawdzanie danych…';
+ log.textContent='';output.style.display='block';output.className='message ok';output.textContent='Importowanie listy aplikacji…';
+ const addLog=(text)=>{log.textContent+=text+'\n';log.scrollTop=log.scrollHeight};
+ try{
+  addLog('Odczyt danych JSON z formularza.');
+  const input=JSON.parse($('appsJson').value);
+  if(!input||!Array.isArray(input.apps))throw new Error('Wklej obiekt JSON z listą apps.');
+  addLog('Odczytano '+input.apps.length+' wpisów.');
+  phase.textContent='Przesyłanie '+input.apps.length+' wpisów do aplikacji…';
+  addLog('Wysyłanie i walidacja danych na serwerze…');
+  const result=await api('/api/aplikacje/import','POST',input);
+  if(!result.success)throw new Error(result.message||'Serwer odrzucił import.');
+  addLog(result.message);phase.textContent='Odświeżanie listy aplikacji…';
+  await refreshApps();addLog('Lista aplikacji została odświeżona.');
+  track.classList.add('complete');track.setAttribute('aria-valuetext','Import zakończony');
+  stage.textContent='Import zakończony';phase.textContent='Gotowe';
+  output.className='message ok';output.textContent=result.message;
+ }catch(e){
+  addLog('BŁĄD: '+e.message);track.classList.add('failed');track.setAttribute('aria-valuetext','Import nieudany');
+  stage.textContent='Błąd importu';phase.textContent='Sprawdź log';
+  output.className='message error';output.textContent='Import nieudany: '+e.message;
+ }finally{button.disabled=false}
+};
 async function backupPoll(){
  const s=await api('/api/backup/status');const btn=$('runBackup');btn.disabled=!s.available||s.status==='running';
  const box=$('backupMessage');box.style.display='block';box.className='message '+(s.status==='error'?'error':'ok');
