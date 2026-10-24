@@ -1,3 +1,17 @@
+# YunoHost Backup Manager **0.5~ynh18**
+
+## Nowości: usuwanie archiwów bezpośrednio z panelu
+
+- W zakładce **Kopie zapasowe** wybierz magazyn i zaznacz archiwum; przycisk **Usuń wybraną kopię** jest obok **Przywróć wybraną kopię**.
+- Pojawia się okno potwierdzenia z nazwą archiwum i magazynu. Operacja wymaga wpisania **USUŃ**.
+- Usuwane są **tylko pliki wybranego archiwum** na wskazanym magazynie: `.report.json`, `.info.json` i `.tar` (o ile występują). Nie są usuwane inne kopie, aplikacje YunoHost ani dane magazynu.
+- Gdy trwa backup, przywracanie albo aktualizacja, usuwanie jest blokowane. Dodatkowa ochrona CSRF, walidacja nazwy archiwum i jednorazowy token żądania.
+- Jeśli na SMB wystąpi błąd przy usuwaniu, operacja zostaje przerwana i wyświetla szczegóły. Archiwum `.tar` jest usuwane jako ostatnie, aby wcześniejszy błąd nie skasował właściwej zawartości kopii.
+- Funkcja korzysta z istniejących połączeń SMB1/SMB2/SMB3 i przekierowania Tailscale wewnątrz wtyczki. Nie zmienia konfiguracji systemu, OMV, sieci ani Tailscale.
+- Pozostałe możliwości wersji 0.5~ynh17 pozostają bez zmian.
+
+---
+
 # YunoHost Backup Manager **0.5~ynh17**
 
 ## Nowości: raport wykonania każdej kopii
@@ -15,7 +29,7 @@
 
 ## Historia: 0.5~ynh16 — poprzednia wersja
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh17**
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh18**
 
 ## Zmiany w 0.5~ynh16 — ponowna instalacja i Harmonogram (cron)
 

@@ -1350,6 +1350,113 @@ def remote_backup_report(cfg, name):
     return try_protocol(cfg, legacy, modern)
 
 
+def delete_remote_archive(cfg, name):
+    """Remove only the three known files for a selected backup on one SMB share.
+
+    Remove metadata first and the .tar last, retaining the actual backup if an
+    earlier step fails. Never remove arbitrary paths or unrelated files.
+    """
+    if not archive_name_ok(name):
+        raise ValueError('Nieprawidłowa nazwa kopii.')
+    filenames = [name + ext for ext in ('.report.json', '.info.json', '.tar')]
+    deleted = []
+    deletion_attempted = [False]
+
+    def legacy():
+        with SMB_LOCK:
+            with smb_endpoint(cfg['server']) as endpoint:
+                conn = connect_legacy(cfg, True, endpoint.host, endpoint.port)
+                try:
+                    folder = remote_folder(cfg)
+                    entries = {entry.filename for entry in
+                               conn.listPath(cfg['share'], folder + '/' if folder else '/', timeout=45)
+                               if not entry.isDirectory}
+                    if name + '.tar' not in entries:
+                        raise FileNotFoundError('Nie znaleziono archiwum na magazynie SMB.')
+                    for filename in filenames:
+                        if filename in entries:
+                            deletion_attempted[0] = True
+                            conn.deleteFiles(cfg['share'], folder + '/' + filename, timeout=90)
+                            deleted.append(filename)
+                    return list(deleted)
+                finally:
+                    conn.close()
+
+    def modern():
+        cache = {}
+        with smb_endpoint(cfg['server']) as endpoint:
+            server = endpoint.host
+            root = remote_unc(cfg, server)
+            user = (cfg['domain'] + '\\' if cfg['domain'] else '') + cfg['username']
+            try:
+                smbclient.register_session(server, username=user, password=cfg['password'],
+                                           port=endpoint.port, connection_timeout=15,
+                                           connection_cache=cache)
+                entries = set(smbclient.listdir(root, port=endpoint.port, connection_cache=cache))
+                if name + '.tar' not in entries:
+                    raise FileNotFoundError('Nie znaleziono archiwum na magazynie SMB.')
+                for filename in filenames:
+                    if filename in entries:
+                        deletion_attempted[0] = True
+                        smbclient.remove(root + '\\' + filename, port=endpoint.port, connection_cache=cache)
+                        deleted.append(filename)
+                return list(deleted)
+            finally:
+                try:
+                    smbclient.delete_session(server, port=endpoint.port, connection_cache=cache)
+                except Exception:
+                    pass
+
+    try:
+        if cfg['protocol'] == 'smb1':
+            return legacy()
+        if cfg['protocol'] == 'smb2':
+            return modern()
+        try:
+            return modern()
+        except Exception:
+            # In auto mode SMB1 fallback is allowed only before ANY deletion
+            # attempt, so a partial failure cannot silently switch dialects.
+            if deletion_attempted[0]:
+                raise
+            return legacy()
+    except Exception as exc:
+        if deleted:
+            raise RuntimeError('Nie udało się usunąć całej kopii. Usunięte pliki: '
+                               + ', '.join(deleted) + '. Pozostałe pliki mogą nadal być na SMB. '
+                               + str(exc)[:250]) from exc
+        raise
+
+
+@app.post('/api/backup/delete')
+def backup_delete():
+    csrf = request.headers.get('X-Delete-CSRF', '')
+    expected = session.get('delete_csrf', '')
+    if not csrf or not expected or not hmac.compare_digest(csrf, expected):
+        return jsonify(success=False, message='Odśwież listę archiwów przed usunięciem.'), 403
+    payload = request.get_json(silent=True) or {}
+    storage_id, name = payload.get('storage'), payload.get('name')
+    if not isinstance(storage_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,49}', storage_id) or not archive_name_ok(name):
+        return jsonify(success=False, message='Nieprawidłowy magazyn lub archiwum.'), 400
+    if payload.get('confirmation') != 'USUŃ':
+        return jsonify(success=False, message='Potwierdź usunięcie słowem USUŃ.'), 400
+    if read_state().get('status') in ('launching', 'running'):
+        return jsonify(success=False, message='Trwa aktualizacja aplikacji.'), 409
+    if not BACKUP_LOCK.acquire(blocking=False):
+        return jsonify(success=False, message='Trwa tworzenie lub przywracanie kopii.'), 409
+    try:
+        # A one-time token prevents repeating a destructive operation.
+        session.pop('delete_csrf', None)
+        cfg = cfg_from_storage(storage_id)
+        deleted = delete_remote_archive(cfg, name)
+        return jsonify(success=True, message='Usunięto kopię z magazynu SMB: ' + name,
+                       deleted=deleted)
+    except Exception as exc:
+        return jsonify(success=False, message='Nie udało się usunąć kopii: ' + str(exc)[:650]), 400
+    finally:
+        BACKUP_LOCK.release()
+
+
 @app.get('/api/backup/report')
 def backup_report():
     storage_id, name = request.args.get('storage', ''), request.args.get('name', '')
@@ -1379,7 +1486,9 @@ def restore_archives():
             record['conflicts'] = [a for a in record['apps'] if a in installed]
         token = secrets.token_urlsafe(32)
         session['restore_csrf'] = token
-        return jsonify(success=True, archives=entries, csrf=token)
+        delete_token = secrets.token_urlsafe(32)
+        session['delete_csrf'] = delete_token
+        return jsonify(success=True, archives=entries, csrf=token, delete_csrf=delete_token)
     except Exception as exc:
         return jsonify(success=False, message=type(exc).__name__ + ': ' + str(exc)[:600]), 400
 
@@ -1744,7 +1853,7 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 <div class="tablewrap"><table class="archive-table"><thead><tr><th></th><th>Archiwum</th><th>Data</th><th>Rozmiar</th><th>Aplikacje w kopii</th><th>Stan</th></tr></thead>
 <tbody id="archiveRows"><tr><td colspan="6">Wybierz magazyn, aby wyświetlić archiwa.</td></tr></tbody></table></div>
 <div class="archive-actions"><span class="archive-selection" id="archiveSelection">Nie wybrano archiwum.</span>
-<button type="button" id="restoreSelected" disabled>Przywróć wybraną kopię</button></div>
+<button type="button" id="restoreSelected" disabled>Przywróć wybraną kopię</button><button type="button" id="deleteSelected" class="danger" disabled>Usuń wybraną kopię</button></div>
 <p class="archive-help">Kliknij nazwę kopii, aby zobaczyć jej raport i przebieg wykonywania. Kopie sprzed wersji 0.5~ynh17 mogą nie mieć raportu. Wykaz pochodzi bezpośrednio z magazynu SMB. Przywracanie pobiera wybrane archiwum, a następnie uruchamia mechanizm YunoHost. Aplikacja nie usuwa ani nie nadpisuje istniejących instalacji.</p>
 <div id="archiveMessage" class="message"></div>
 <div class="backup-create-panel" id="backupCreatePanel" hidden>
@@ -1775,6 +1884,14 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 <h2 id="reportDialogHeading">Raport wykonania kopii</h2>
 <div id="reportBody" role="status">Wczytywanie raportu…</div>
 <div class="actions"><button type="button" class="secondary" id="closeReport">Zamknij</button></div>
+</dialog>
+<dialog class="restore-dialog" id="deleteDialog" aria-labelledby="deleteDialogHeading">
+<h2 id="deleteDialogHeading">Usuń kopię z magazynu SMB</h2>
+<p id="deleteDialogName"></p>
+<div class="restore-alert bad">Ta operacja nieodwracalnie usunie archiwum .tar oraz powiązane pliki .info.json i .report.json, jeśli istnieją. Nie usuwa zainstalowanych aplikacji YunoHost.</div>
+<label for="deletePhrase">Aby potwierdzić, wpisz <strong>USUŃ</strong></label>
+<input id="deletePhrase" type="text" autocomplete="off" spellcheck="false" placeholder="USUŃ" />
+<div class="actions"><button type="button" class="secondary" id="cancelDelete">Anuluj</button><button type="button" id="confirmDelete" class="danger" disabled>Usuń kopię bezpowrotnie</button></div>
 </dialog>
 <dialog class="restore-dialog" id="restoreDialog" aria-labelledby="restoreDialogHeading"><h2 id="restoreDialogHeading">Przywracanie archiwum</h2>
 <p id="restoreDialogName"></p><p>Wybierz aplikacje z archiwum:</p><div id="restoreApps"></div>
@@ -1900,7 +2017,7 @@ $('importApps').onclick=async()=>{
 };
 
 // Biblioteka archiwów i przywracanie w tym samym widoku (jak magazyn kopii w Proxmox).
-let archiveRecords=[], selectedArchive='', restoreToken='', restoreRunning=false, backupWasRunning=false;
+let archiveRecords=[], selectedArchive='', restoreToken='', deleteToken='', restoreRunning=false, backupWasRunning=false, deletingArchive=false;
 let activeRestore=null, lastRestoreFinished='';
 function archiveNotice(ok,text){const box=$('archiveMessage');box.style.display='block';box.className='message '+(ok?'ok':'error');box.textContent=text}
 function readableSize(bytes){if(!Number.isFinite(bytes))return '—';return bytes>=1073741824?(bytes/1073741824).toFixed(2)+' GiB':(bytes/1048576).toFixed(1)+' MiB'}
@@ -1929,7 +2046,8 @@ function showArchiveRows(){const target=$('archiveRows');target.replaceChildren(
  }
  const selected=archiveRecords.find(a=>a.name===selectedArchive);
  const okay=Boolean(selected&&selected.complete&&!selected.message&&selected.apps?.length&&!restoreRunning);
- $('restoreSelected').disabled=!okay;
+ $('restoreSelected').disabled=!okay || deletingArchive;
+ $('deleteSelected').disabled=!selected || restoreRunning || backupWasRunning || deletingArchive;
  $('archiveSelection').textContent=selected?'Wybrano: '+selected.name:'Nie wybrano archiwum.';
 }
 function reportField(list,label,value){
@@ -1976,16 +2094,16 @@ async function openArchiveReport(name){
 $('closeReport').onclick=()=>$('reportDialog').close();
 async function refreshArchives(){
  const storage=$('backupStorage').value;
- selectedArchive='';archiveRecords=[];restoreToken='';
+ selectedArchive='';archiveRecords=[];restoreToken='';deleteToken='';
  const target=$('archiveRows');target.replaceChildren();
  if(!storage){const r=target.insertRow();const td=r.insertCell();td.colSpan=6;td.textContent='Wybierz magazyn.';
-  $('restoreSelected').disabled=true;$('archiveSelection').textContent='Nie wybrano archiwum.';return}
+  $('restoreSelected').disabled=true;$('deleteSelected').disabled=true;$('archiveSelection').textContent='Nie wybrano archiwum.';return}
  const row=target.insertRow();const td=row.insertCell();td.colSpan=6;td.textContent='Odczytywanie archiwów z magazynu SMB…';
- $('reloadArchives').disabled=true;$('restoreSelected').disabled=true;
+ $('reloadArchives').disabled=true;$('restoreSelected').disabled=true;$('deleteSelected').disabled=true;
  try{
   const result=await api('/api/restore/archives?storage='+encodeURIComponent(storage));
   if(!result.success)throw new Error(result.message||'Nie udało się pobrać listy.');
-  archiveRecords=result.archives||[];restoreToken=result.csrf||'';
+  archiveRecords=result.archives||[];restoreToken=result.csrf||'';deleteToken=result.delete_csrf||'';
   showArchiveRows();
   $('archiveMessage').style.display='none';
  }catch(e){archiveRecords=[];target.replaceChildren();const r=target.insertRow();const td=r.insertCell();td.colSpan=6;td.textContent='Nie udało się pobrać listy archiwów.';archiveNotice(false,e.message);}
@@ -1993,6 +2111,32 @@ async function refreshArchives(){
 }
 $('backupStorage').addEventListener('change',()=>refreshArchives());
 $('reloadArchives').onclick=()=>refreshArchives();
+$('deleteSelected').onclick=()=>{
+ const selected=archiveRecords.find(a=>a.name===selectedArchive);
+ if(!selected||!deleteToken||restoreRunning||backupWasRunning||deletingArchive)return;
+ $('deleteDialogName').textContent='Magazyn: '+$('backupStorage').selectedOptions[0]?.text+'\nArchiwum: '+selected.name;
+ $('deleteDialogName').style.whiteSpace='pre-wrap';
+ $('deletePhrase').value='';$('confirmDelete').disabled=true;
+ $('deleteDialog').showModal();
+};
+$('deletePhrase').addEventListener('input',()=>{$('confirmDelete').disabled=$('deletePhrase').value.trim()!=='USUŃ'});
+$('cancelDelete').onclick=()=>$('deleteDialog').close();
+$('confirmDelete').onclick=async()=>{
+ const name=selectedArchive, storage=$('backupStorage').value, token=deleteToken;
+ if(!token||$('deletePhrase').value.trim()!=='USUŃ'||deletingArchive)return;
+ $('deleteDialog').close();deletingArchive=true;deleteToken='';showArchiveRows();
+ archiveNotice(true,'Usuwanie wybranego archiwum z SMB…');
+ try{
+  const base=window.location.pathname.replace(/\/$/,'');
+  const response=await fetch(base+'/api/backup/delete',{method:'POST',headers:{'Content-Type':'application/json','X-Delete-CSRF':token},
+   body:JSON.stringify({storage,name,confirmation:'USUŃ'})});
+  const result=await response.json();
+  await refreshArchives();
+  archiveNotice(Boolean(result.success),result.message||'Brak odpowiedzi z serwera.');
+ }catch(e){await refreshArchives().catch(()=>{});archiveNotice(false,'Nie udało się usunąć kopii: '+e.message)}
+ finally{deletingArchive=false;showArchiveRows()}
+};
+
 $('showBackupForm').onclick=()=>{$('backupCreatePanel').hidden=false;$('showBackupForm').disabled=true;};
 $('hideBackupForm').onclick=()=>{if(backupWasRunning)return;$('backupCreatePanel').hidden=true;$('showBackupForm').disabled=false;};
 function syncRestoreDialog(){
@@ -2065,7 +2209,9 @@ async function backupPoll(){
  box.textContent=s.available?s.message:'Tryb Windows: kopie będą dostępne po uruchomieniu aplikacji na YunoHost.';
  const progress=$('backupProgress'),logPanel=$('backupLogPanel'),track=$('backupTrack'),fill=$('backupFill');
  if(s.status==='idle'){progress.hidden=true;logPanel.hidden=true;return}
+ const previousBackup=backupWasRunning;
  if(s.status==='running')backupWasRunning=true;else if(backupWasRunning && s.status==='success'){backupWasRunning=false;refreshArchives().catch(()=>{})}else if(s.status==='error')backupWasRunning=false;
+ if(previousBackup!==backupWasRunning)showArchiveRows();
  progress.hidden=false;logPanel.hidden=false;track.className='update-track';fill.style.width='';
  const names={prepare:'Sprawdzanie miejsca',create:'Tworzenie archiwum YunoHost',
               transfer:'Transfer i weryfikacja SMB',report:'Zapis raportu SHA256',cleanup:'Usuwanie kopii lokalnej',
