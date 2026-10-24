@@ -4,6 +4,7 @@ Only a validated complete.json is a backup. Partial directories are staging and
 are deliberately hidden from the library. No external daemon, mount, or cron.
 """
 from contextlib import contextmanager
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import datetime
 import errno
@@ -464,7 +465,8 @@ def download_file(store, name, role, info, destination, progress=None, cancelled
         raise IOError('Pełne archiwum po złożeniu ma błędne SHA256.')
 
 
-def synchronize_chunks(store, name, local_files, manifest, on_verified=None, cancelled=None, on_progress=None):
+def synchronize_chunks(store, name, local_files, manifest, on_verified=None, cancelled=None,
+                       on_progress=None, workers=1, store_factory=None):
     """Recheck *every* chunk; transfer only absent/invalid chunks.
 
     No completeness marker is written by this function. Caller publishes it
@@ -474,6 +476,7 @@ def synchronize_chunks(store, name, local_files, manifest, on_verified=None, can
     manifest_validate(manifest, name, require_complete=False)
     store.ensure_directory(name)
     result = {'sent': 0, 'reused': 0}
+    jobs = []
     for role in ('tar', 'info'):
         local = pathlib.Path(local_files[role])
         descriptor = manifest['files'][role]
@@ -487,16 +490,75 @@ def synchronize_chunks(store, name, local_files, manifest, on_verified=None, can
             if chunk['sha256'] is not None and chunk['sha256'] != digest:
                 raise RuntimeError('Zmieniono lokalny fragment w trakcie przesyłania.')
             chunk['sha256'] = digest
-            def progress(stage, amount):
-                if cancelled and cancelled():
-                    raise InterruptedError('Operator zatrzymał przesyłanie kopii.')
-                if on_progress:
-                    on_progress(role, n, stage, amount)
-            outcome = upload_one(store, local, name, chunk, offset, digest,
-                                 progress=progress, cancelled=cancelled)
-            result['reused' if outcome == 'verified_existing' else 'sent'] += 1
-            if on_verified:
-                on_verified(role, n, len(descriptor['chunks']), chunk['bytes'], outcome)
+            jobs.append((role, n, len(descriptor['chunks']), local, chunk, offset, digest))
+
+    def process_one(worker_store, job, stop=None):
+        role, n, count, local, chunk, offset, digest = job
+        def interrupted():
+            return (stop is not None and stop.is_set()) or (cancelled and cancelled())
+        if interrupted():
+            raise InterruptedError('Operator zatrzymał przesyłanie kopii.')
+        def progress(stage, amount):
+            if interrupted():
+                raise InterruptedError('Operator zatrzymał przesyłanie kopii.')
+            if on_progress:
+                on_progress(role, n, stage, amount)
+        return upload_one(worker_store, local, name, chunk, offset, digest,
+                          progress=progress, cancelled=interrupted)
+
+    def finished(job, outcome):
+        role, n, count, _local, chunk, _offset, _digest = job
+        result['reused' if outcome == 'verified_existing' else 'sent'] += 1
+        if on_verified:
+            on_verified(role, n, count, chunk['bytes'], outcome)
+
+    # SMB1 uses a process-wide dialect flag in PySMB. Keep it strictly serial.
+    # For SMB2/3 each worker gets its own SMB session, cache and endpoint. The
+    # parent session is reserved for final manifests and the commit marker.
+    if workers <= 1 or not store_factory or len(jobs) <= 1:
+        for job in jobs:
+            finished(job, process_one(store, job))
+    else:
+        workers = min(int(workers), 3, len(jobs))
+        stop = threading.Event()
+        first_error = None
+        work = iter(jobs)
+
+        def run_worker(job):
+            if stop.is_set():
+                raise InterruptedError('Zatrzymano inne przesyłania po błędzie.')
+            with store_factory() as worker_store:
+                return process_one(worker_store, job, stop)
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='ybm-part') as pool:
+            active = {}
+            def submit_next():
+                if stop.is_set():
+                    return
+                job = next(work, None)
+                if job is not None:
+                    active[pool.submit(run_worker, job)] = job
+
+            for _ in range(workers):
+                submit_next()
+            while active:
+                ready, _ = wait(tuple(active), return_when=FIRST_COMPLETED)
+                for future in ready:
+                    job = active.pop(future)
+                    try:
+                        outcome = future.result()
+                        finished(job, outcome)
+                    except Exception as exc:
+                        # Preserve the original network error rather than a
+                        # secondary cancellation from another worker.
+                        if first_error is None or (isinstance(first_error, InterruptedError)
+                                                   and not isinstance(exc, InterruptedError)):
+                            first_error = exc
+                        stop.set()
+                    if not stop.is_set():
+                        submit_next()
+        if first_error is not None:
+            raise first_error
     manifest_validate(manifest, name, require_complete=False)
     return result
 

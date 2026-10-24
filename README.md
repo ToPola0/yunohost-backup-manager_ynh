@@ -1,4 +1,13 @@
-# YunoHost Backup Manager **0.5~ynh22**
+# YunoHost Backup Manager **0.5~ynh23**
+
+## Zmiany w 0.5~ynh23 — równoległe przesyłanie części
+
+- **SMB2/3:** maksymalnie **3 części naraz**, z niezależnymi połączeniami SMB i osobną weryfikacją SHA256 każdej części.
+- **SMB1:** części nadal przesyłane pojedynczo (biblioteka PySMB korzysta z globalnego przełącznika dialektu).
+- Wszystkie części pozostają w jednym katalogu kopii na magazynie SMB; nie powstają dodatkowe katalogi.
+- W tabeli panelu widać jednocześnie postęp wszystkich aktualnie przesyłanych/weryfikowanych części.
+- Po rozłączeniu sprawdzane są zdalne sumy SHA256, a brakujące/uszkodzone części są ponawiane; kopia jest publikowana dopiero po pełnej weryfikacji.
+- W trakcie aktywnej kopii **nie aktualizować usługi**; zaczekać na zakończenie, aby uniknąć zbędnego wznowienia.
 
 ## Zmiany w 0.5~ynh22 — nawigacja panelu
 

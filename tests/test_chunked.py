@@ -3,6 +3,9 @@ import hashlib
 import io
 import json
 import os
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 import sys
 import tempfile
@@ -198,6 +201,68 @@ class ChunkTests(unittest.TestCase):
         with self.assertRaises(InterruptedError):
             self.transfer(cancelled=cancel)
         self.assertIsNone(c.read_manifest(self.store, self.name))
+
+    def test_three_parallel_parts_separate_sessions_and_one_folder(self):
+        class ParallelStore(FakeStore):
+            def __init__(self):
+                super().__init__()
+                self.monitor = threading.Lock()
+                self.active = 0
+                self.maximum_active = 0
+                self.session_count = 0
+
+            def stream_write(self, rel, reader, expected, callback=None):
+                with self.monitor:
+                    self.active += 1
+                    self.maximum_active = max(self.maximum_active, self.active)
+                try:
+                    time.sleep(0.03)  # Reproducible overlap of independent parts
+                    super().stream_write(rel, reader, expected, callback)
+                finally:
+                    with self.monitor:
+                        self.active -= 1
+
+        remote = ParallelStore()
+        @contextmanager
+        def new_session():
+            with remote.monitor:
+                remote.session_count += 1
+            yield remote
+
+        states = []
+        result = c.synchronize_chunks(remote, self.name, self.files, self.manifest,
+                                      workers=3, store_factory=new_session,
+                                      on_verified=lambda *a: states.append(a))
+        self.assertEqual(result, {'sent': 6, 'reused': 0})
+        self.assertEqual(remote.maximum_active, 3)
+        self.assertEqual(remote.session_count, 6)
+        self.assertEqual(len(states), 6)
+        self.assertEqual(remote.directories, {self.name})
+        self.assertEqual(len(remote.listing(self.name)), 6)
+        # All verified parts are reused on subsequent attempts.
+        again = c.synchronize_chunks(remote, self.name, self.files, self.manifest,
+                                     workers=3, store_factory=new_session)
+        self.assertEqual(again, {'sent': 0, 'reused': 6})
+
+    def test_parallel_failure_resume_only_missing_and_bad_part(self):
+        @contextmanager
+        def new_session():
+            yield self.store
+
+        self.store.fail_upload = self.name + '/tar.000001.part'
+        with self.assertRaises(ConnectionError):
+            c.synchronize_chunks(self.store, self.name, self.files, self.manifest,
+                                 workers=3, store_factory=new_session)
+        self.assertIsNone(c.read_manifest(self.store, self.name))
+        previously_complete = dict(self.store.upload_count)
+        answer = c.synchronize_chunks(self.store, self.name, self.files, self.manifest,
+                                      workers=3, store_factory=new_session)
+        self.assertEqual(answer['sent'] + answer['reused'], 6)
+        self.assertGreater(answer['reused'], 0)
+        for part in previously_complete:
+            self.assertEqual(self.store.upload_count[part], previously_complete[part])
+        self.commit()
+        self.assertEqual(c.read_manifest(self.store, self.name)['archive'], self.name)
 
 
 if __name__ == '__main__':

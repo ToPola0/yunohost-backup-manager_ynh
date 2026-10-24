@@ -754,19 +754,26 @@ def transfer_resumable(job):
                          'brakujące lub błędne zostaną nadpisane.',
                          phase='transfer', status='running', percent=0)
             dialect = chunk_dialect(cfg)
+            workers = 3 if dialect == 'smb2' else 1
+            backup_event(('SMB2/3: maksymalnie 3 części przesyłane i weryfikowane równocześnie.'
+                          if workers > 1 else 'SMB1: przesyłanie i weryfikacja części kolejno.'),
+                         phase='transfer', status='running', percent=0)
             done = [0]
-            partial = [0]
+            partial_total = [0]
+            partial_by_chunk = {(row['role'], row['number']): 0 for row in rows}
 
             def live_progress(role, n, stage, amount):
                 with BACKUP_STATE_GUARD:
                     row = by_chunk[(role, n)]
+                    key = (role, n)
+                    old_weighted = partial_by_chunk[key]
                     # A failed SHA256 check is followed by a new upload of the
                     # very same part, not a second directory or a duplicate part.
                     if stage == 'reset':
-                        partial[0] = 0
                         row['stage_bytes'] = 0
                         row['status'] = 'upload'
                         row['percent'] = 0
+                        weighted = 0
                     else:
                         if row['status'] != stage:
                             row['status'] = stage
@@ -774,21 +781,30 @@ def transfer_resumable(job):
                             row['percent'] = 0
                         row['stage_bytes'] = min(row['bytes'], row['stage_bytes'] + amount)
                         row['percent'] = min(100, int(row['stage_bytes'] * 100 / max(row['bytes'], 1)))
-                        partial[0] += amount * (2 if stage == 'check' else 1)
-                    BACKUP_STATE['done_bytes'] = min(total, done[0] + partial[0])
+                        # Existing part: one full remote read proves two stages.
+                        # New part: upload + SHA256 read-back, independently
+                        # of the other concurrently running parts.
+                        weighted = (2 * row['stage_bytes'] if stage == 'check' else
+                                    row['bytes'] + row['stage_bytes'] if stage == 'verify' else
+                                    row['stage_bytes'])
+                    partial_by_chunk[key] = weighted
+                    partial_total[0] += weighted - old_weighted
+                    BACKUP_STATE['done_bytes'] = min(total, done[0] + partial_total[0])
                     BACKUP_STATE['percent'] = min(100, int(100 * BACKUP_STATE['done_bytes'] / max(total, 1)))
 
             def verified(role, n, count, nbytes, outcome):
-                done[0] += 2 * nbytes
-                partial[0] = 0
                 with BACKUP_STATE_GUARD:
+                    key = (role, n)
+                    partial_total[0] -= partial_by_chunk[key]
+                    partial_by_chunk[key] = 0
+                    done[0] += 2 * nbytes
                     row = by_chunk[(role, n)]
                     row['status'] = 'reused' if outcome == 'verified_existing' else 'verified'
                     row['stage_bytes'] = nbytes
                     row['percent'] = 100
-                    BACKUP_STATE['done_bytes'] = done[0]
+                    BACKUP_STATE['done_bytes'] = min(total, done[0] + partial_total[0])
                     BACKUP_STATE['total_bytes'] = total
-                    BACKUP_STATE['percent'] = min(100, int(done[0] * 100 / max(total, 1)))
+                    BACKUP_STATE['percent'] = min(100, int(BACKUP_STATE['done_bytes'] * 100 / max(total, 1)))
                 message = ('Już poprawna' if outcome == 'verified_existing' else 'Wysłana i zweryfikowana')
                 backup_event(f'{message} część {role} {n+1}/{count} (SHA256).',
                              phase='transfer', status='running', percent=BACKUP_STATE['percent'])
@@ -809,7 +825,8 @@ def transfer_resumable(job):
                 save_manifest(store, name, manifest, finished=False)
                 summary = synchronize_chunks(store, name, files, manifest,
                      on_verified=verified, cancelled=lambda: transfer_cancelled(name),
-                     on_progress=live_progress)
+                     on_progress=live_progress, workers=workers,
+                     store_factory=(lambda: open_chunk_store(cfg, 'smb2')) if workers > 1 else None)
                 if transfer_cancelled(name):
                     raise InterruptedError('Operator przerwał wykonywanie kopii.')
                 backup_event(f'Zweryfikowano wszystkie części. Wysłano: {summary["sent"]}; '
