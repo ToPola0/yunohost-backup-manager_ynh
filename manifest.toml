@@ -3,15 +3,20 @@ id = "yunohost-backup-manager"
 name = "YunoHost Backup Manager"
 description.en = "Back up YunoHost applications to SMB shares"
 description.pl = "Kopie zapasowe aplikacji YunoHost na udziały SMB"
-version = "0.5~ynh1"
-maintainers = []
+version = "0.5~ynh2"
+maintainers = ["ToPola0"]
+
+[upstream]
+license = "LicenseRef-Proprietary"
+code = "https://github.com/ToPola0/yunohost-backup-manager_ynh"
 
 [integration]
-yunohost = ">= 12.0"
+yunohost = ">= 12.1"
+helpers_version = "2.1"
 architectures = "all"
 multi_instance = false
-ldap = "not_relevant"
-sso = "not_relevant"
+ldap = false
+sso = false
 disk = "100M"
 ram.build = "300M"
 ram.runtime = "100M"
@@ -26,7 +31,7 @@ ram.runtime = "100M"
 [resources]
     [resources.system_user]
     [resources.install_dir]
-    dir = "/opt/yunohost-backup-manager"
+    dir = "/opt/yunohost-backup-manager-ynh"
     [resources.permissions]
         [resources.permissions.main]
         url = "/"
