@@ -19,6 +19,7 @@ import time
 import hmac
 import secrets
 import unicodedata
+import tempfile
 from updater import APP_VERSION, check_remote, read_state, write_state, read_log_chunk, LOG_FILE
 
 app = Flask(__name__)
@@ -595,10 +596,419 @@ def backup_start():
     if read_state().get('status') in ('launching', 'running'):
         return jsonify(success=False, message='Trwa aktualizacja aplikacji. Poczekaj na zakończenie.'), 409
     if not BACKUP_LOCK.acquire(blocking=False):
-        return jsonify(success=False, message='Kopia już trwa.'), 409
+        return jsonify(success=False, message='Trwa już tworzenie lub przywracanie kopii.'), 409
     backup_event('Rozpoczynanie kopii…', phase='prepare', status='running', reset=True)
     threading.Thread(target=backup_worker, args=(app_ids, storage_id, [app_labels[a] for a in app_ids]), daemon=True).start()
     return jsonify(success=True, message='Rozpoczęto wykonywanie kopii.')
+
+
+# Archiwum -> wybór kopii -> przywracanie: w tym samym panelu co tworzenie.
+# Wykorzystuje wyłącznie istniejące połączenia SMB wtyczki i interfejs CLI YunoHost.
+RESTORE_STATE_GUARD = threading.RLock()
+RESTORE_STATE = {'status': 'idle', 'phase': 'idle', 'percent': None,
+                 'message': 'Nie uruchomiono przywracania.', 'done_bytes': 0,
+                 'total_bytes': 0, 'log': []}
+ARCHIVE_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,179}\Z')
+RESTORE_METADATA_MAX = 2 * 1024 * 1024
+
+
+def restore_event(message, phase=None, status=None, percent=None, reset=False):
+    with RESTORE_STATE_GUARD:
+        if reset:
+            RESTORE_STATE.update(log=[], done_bytes=0, total_bytes=0)
+        RESTORE_STATE['message'] = str(message)
+        RESTORE_STATE['percent'] = percent
+        if phase is not None:
+            RESTORE_STATE['phase'] = phase
+        if status is not None:
+            RESTORE_STATE['status'] = status
+        RESTORE_STATE['log'] = (RESTORE_STATE['log'] +
+            [time.strftime('%H:%M:%S') + '  ' + str(message)])[-160:]
+
+
+def remote_folder(cfg):
+    return '/' + cfg['subdirectory'].strip('/') if cfg['subdirectory'] else ''
+
+
+def remote_unc(cfg, server):
+    root = '\\\\' + server + '\\' + cfg['share']
+    if cfg['subdirectory']:
+        root += '\\' + cfg['subdirectory'].replace('/', '\\')
+    return root
+
+
+def archive_name_ok(name):
+    return isinstance(name, str) and bool(ARCHIVE_NAME_RE.fullmatch(name)) and '..' not in name
+
+
+def parse_archive_metadata(data):
+    import json
+    if len(data) > RESTORE_METADATA_MAX:
+        raise ValueError('Metadane archiwum są za duże.')
+    meta = json.loads(data.decode('utf-8'))
+    apps = meta.get('apps', {})
+    if not isinstance(apps, dict):
+        raise ValueError('Archiwum nie zawiera poprawnej listy aplikacji.')
+    app_ids = [app_id for app_id in apps if isinstance(app_id, str)
+               and re.fullmatch(r'[A-Za-z0-9_]{1,100}', app_id)]
+    if len(app_ids) != len(apps):
+        raise ValueError('Archiwum zawiera nieprawidłowe identyfikatory aplikacji.')
+    app_names = {app_id: str(apps[app_id].get('name') or app_id)[:130] if isinstance(apps[app_id], dict) else app_id
+                 for app_id in app_ids}
+    return {'apps': app_ids, 'app_names': app_names, 'created_at': meta.get('created_at') if isinstance(meta.get('created_at'), (int, float)) else None,
+            'description': str(meta.get('description') or '')[:200]}
+
+
+def remote_archive_catalog(cfg, only=None):
+    """List tar+info.json pairs without downloading the tar archive."""
+    if only is not None and not archive_name_ok(only):
+        raise ValueError('Nieprawidłowa nazwa archiwum.')
+
+    def legacy():
+        result = []
+        with SMB_LOCK:
+            with smb_endpoint(cfg['server']) as endpoint:
+                conn = connect_legacy(cfg, True, endpoint.host, endpoint.port)
+                try:
+                    folder = remote_folder(cfg)
+                    entries = {entry.filename: entry for entry in
+                               conn.listPath(cfg['share'], folder + '/' if folder else '/', timeout=45)
+                               if not entry.isDirectory}
+                    names = sorted({n[:-4] for n in entries if n.endswith('.tar') and
+                                    archive_name_ok(n[:-4]) and (only is None or n[:-4] == only)}, reverse=True)
+                    for name in names[:300]:
+                        tar_item = entries[name + '.tar']
+                        info_item = entries.get(name + '.info.json')
+                        record = {'name': name, 'size': int(tar_item.file_size), 'info_size': int(info_item.file_size) if info_item else 0,
+                                  'complete': bool(info_item), 'apps': [], 'app_names': {}, 'created_at': None,
+                                  'message': ''}
+                        if info_item:
+                            if info_item.file_size > RESTORE_METADATA_MAX:
+                                record['message'] = 'Metadane przekraczają limit 2 MiB.'
+                            else:
+                                try:
+                                    sink = io.BytesIO()
+                                    conn.retrieveFile(cfg['share'], folder + '/' + name + '.info.json',
+                                                      sink, timeout=45)
+                                    record.update(parse_archive_metadata(sink.getvalue()))
+                                except Exception as exc:
+                                    record['message'] = 'Nie można odczytać metadanych: ' + str(exc)[:160]
+                        else:
+                            record['message'] = 'Brakuje pliku .info.json'
+                        result.append(record)
+                    return result
+                finally:
+                    conn.close()
+
+    def modern():
+        result = []
+        cache = {}
+        with smb_endpoint(cfg['server']) as endpoint:
+            server = endpoint.host
+            root = remote_unc(cfg, server)
+            user = (cfg['domain'] + '\\' if cfg['domain'] else '') + cfg['username']
+            try:
+                smbclient.register_session(server, username=user, password=cfg['password'],
+                                           port=endpoint.port, connection_timeout=15,
+                                           connection_cache=cache)
+                names_in_folder = set(smbclient.listdir(root, port=endpoint.port, connection_cache=cache))
+                names = sorted({n[:-4] for n in names_in_folder if n.endswith('.tar') and
+                                archive_name_ok(n[:-4]) and (only is None or n[:-4] == only)}, reverse=True)
+                for name in names[:300]:
+                    path = root + '\\' + name + '.tar'
+                    try:
+                        size = int(smbclient.stat(path, port=endpoint.port, connection_cache=cache).st_size)
+                    except OSError:
+                        continue
+                    complete = name + '.info.json' in names_in_folder
+                    record = {'name': name, 'size': size, 'complete': complete, 'info_size': 0,
+                              'apps': [], 'app_names': {}, 'created_at': None, 'message': ''}
+                    if complete:
+                        info_path = root + '\\' + name + '.info.json'
+                        try:
+                            info_size = smbclient.stat(info_path, port=endpoint.port,
+                                                       connection_cache=cache).st_size
+                            record['info_size'] = int(info_size)
+                            if info_size > RESTORE_METADATA_MAX:
+                                raise ValueError('Metadane przekraczają limit 2 MiB.')
+                            with smbclient.open_file(info_path, 'rb', port=endpoint.port,
+                                                     connection_cache=cache) as f:
+                                record.update(parse_archive_metadata(f.read(RESTORE_METADATA_MAX + 1)))
+                        except Exception as exc:
+                            record['message'] = 'Nie można odczytać metadanych: ' + str(exc)[:160]
+                    else:
+                        record['message'] = 'Brakuje pliku .info.json'
+                    result.append(record)
+                return result
+            finally:
+                try:
+                    smbclient.delete_session(server, port=endpoint.port, connection_cache=cache)
+                except Exception:
+                    pass
+
+    return try_protocol(cfg, legacy, modern)
+
+
+class RestoreWriter:
+    def __init__(self, stream, expected, total):
+        self.stream, self.expected, self.total = stream, expected, total
+        self.done = 0
+
+    def write(self, chunk):
+        self.done += len(chunk)
+        if self.done > self.expected:
+            raise RuntimeError('Rozmiar pobieranego archiwum przekroczył deklarowany rozmiar.')
+        result = self.stream.write(chunk)
+        with RESTORE_STATE_GUARD:
+            RESTORE_STATE['done_bytes'] += len(chunk)
+            RESTORE_STATE['percent'] = int(min(100, RESTORE_STATE['done_bytes'] * 100 / max(self.total, 1)))
+        return result
+
+    def flush(self):
+        self.stream.flush()
+
+
+def remote_restore_download(cfg, name, tar_bytes, info_bytes, destination):
+    """Download both original backup files through the app's SMB transport."""
+    files = [(name + '.tar', tar_bytes), (name + '.info.json', info_bytes)]
+    total = tar_bytes + info_bytes
+
+    def legacy():
+        with SMB_LOCK:
+            with smb_endpoint(cfg['server']) as endpoint:
+                conn = connect_legacy(cfg, True, endpoint.host, endpoint.port)
+                try:
+                    folder = remote_folder(cfg)
+                    for filename, expected in files:
+                        restore_event('Pobieranie ' + filename, phase='download', percent=RESTORE_STATE['percent'])
+                        entry = [e for e in conn.listPath(cfg['share'], folder + '/' if folder else '/', timeout=45)
+                                 if e.filename == filename and not e.isDirectory]
+                        if not entry:
+                            raise RuntimeError('Plik zniknął z magazynu: ' + filename)
+                        size = int(entry[0].file_size)
+                        if expected is not None and size != expected:
+                            raise RuntimeError('Archiwum zmieniło rozmiar na magazynie.')
+                        if filename.endswith('.info.json') and size > RESTORE_METADATA_MAX:
+                            raise RuntimeError('Metadane archiwum są zbyt duże.')
+                        with (destination / (filename + '.part')).open('xb') as out:
+                            writer = RestoreWriter(out, size, total)
+                            conn.retrieveFile(cfg['share'], folder + '/' + filename, writer, timeout=7200)
+                            if writer.done != size:
+                                raise RuntimeError('Niekompletny plik: ' + filename)
+                finally:
+                    conn.close()
+
+    def modern():
+        cache = {}
+        with smb_endpoint(cfg['server']) as endpoint:
+            server = endpoint.host
+            root = remote_unc(cfg, server)
+            user = (cfg['domain'] + '\\' if cfg['domain'] else '') + cfg['username']
+            try:
+                smbclient.register_session(server, username=user, password=cfg['password'],
+                                           port=endpoint.port, connection_timeout=15,
+                                           connection_cache=cache)
+                for filename, expected in files:
+                    restore_event('Pobieranie ' + filename, phase='download', percent=RESTORE_STATE['percent'])
+                    remote = root + '\\' + filename
+                    size = int(smbclient.stat(remote, port=endpoint.port, connection_cache=cache).st_size)
+                    if expected is not None and size != expected:
+                        raise RuntimeError('Archiwum zmieniło rozmiar na magazynie.')
+                    if filename.endswith('.info.json') and size > RESTORE_METADATA_MAX:
+                        raise RuntimeError('Metadane archiwum są zbyt duże.')
+                    with smbclient.open_file(remote, 'rb', port=endpoint.port,
+                                             connection_cache=cache) as source, \
+                         (destination / (filename + '.part')).open('xb') as out:
+                        writer = RestoreWriter(out, size, total)
+                        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                            writer.write(chunk)
+                        if writer.done != size:
+                            raise RuntimeError('Niekompletny plik: ' + filename)
+            finally:
+                try:
+                    smbclient.delete_session(server, port=endpoint.port, connection_cache=cache)
+                except Exception:
+                    pass
+
+    def clean_partial():
+        for filename, _ in files:
+            try:
+                (destination / (filename + '.part')).unlink(missing_ok=True)
+            except OSError:
+                pass
+        with RESTORE_STATE_GUARD:
+            RESTORE_STATE['done_bytes'] = 0
+            RESTORE_STATE['percent'] = 0
+
+    def modern_attempt():
+        clean_partial()
+        return modern()
+
+    def legacy_attempt():
+        clean_partial()
+        return legacy()
+
+    try_protocol(cfg, legacy_attempt, modern_attempt)
+
+
+def run_restore_yunohost(name, apps):
+    """Stream actual CLI output; never report success before a zero exit status."""
+    import queue
+    command = ['yunohost', 'backup', 'restore', name, '--apps', *apps]
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, errors='replace', bufsize=1)
+    lines = queue.Queue()
+
+    def reader():
+        try:
+            for line in proc.stdout:
+                lines.put(line.rstrip())
+        finally:
+            lines.put(None)
+
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
+    deadline = time.monotonic() + 7200
+    finished = False
+    while not finished:
+        if time.monotonic() > deadline:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            raise RuntimeError('Przywracanie YunoHost przekroczyło limit 2 godzin.')
+        try:
+            item = lines.get(timeout=1)
+        except queue.Empty:
+            continue
+        if item is None:
+            finished = True
+        elif item:
+            restore_event(item[:1400], phase='restore', status='running')
+    rc = proc.wait(timeout=30)
+    if rc != 0:
+        raise RuntimeError('YunoHost zakończył przywracanie błędem (kod %s). Zobacz log.' % rc)
+
+
+def restore_worker(storage_id, name, apps, size, info_size):
+    created = []
+    staging = None
+    success = False
+    try:
+        cfg = cfg_from_storage(storage_id)
+        restore_event('Przygotowanie do pobrania archiwum: ' + name, phase='prepare', status='running')
+        if any((BACKUP_DIR / (name + ext)).exists() for ext in ('.tar', '.info.json')):
+            raise RuntimeError('Lokalne archiwum o tej nazwie już istnieje. Niczego nie nadpisano.')
+        free = shutil.disk_usage(BACKUP_DIR).free
+        if free < size + max(256 * 1024 * 1024, size // 4):
+            raise RuntimeError('Za mało miejsca lokalnego na pobranie i przygotowanie przywracania.')
+        with RESTORE_STATE_GUARD:
+            RESTORE_STATE['total_bytes'] = size + info_size
+        restore_event('Pobieranie archiwum SMB; nie zmieniamy pliku na magazynie.',
+                      phase='download', percent=0)
+        staging = pathlib.Path(tempfile.mkdtemp(prefix='.ybm-restore-', dir=BACKUP_DIR))
+        remote_restore_download(cfg, name, size, info_size, staging)
+        for ext in ('.tar', '.info.json'):
+            part = staging / (name + ext + '.part')
+            target = BACKUP_DIR / (name + ext)
+            if target.exists():
+                raise RuntimeError('W międzyczasie utworzono lokalne archiwum o tej nazwie.')
+            part.rename(target)
+            created.append(target)
+        local_meta = parse_archive_metadata((BACKUP_DIR / (name + '.info.json')).read_bytes())
+        if not set(apps).issubset(set(local_meta['apps'])):
+            raise RuntimeError('Lista aplikacji w archiwum zmieniła się podczas pobierania.')
+        installed = {a['id'] for a in actual_apps()}
+        collision = sorted(installed.intersection(apps))
+        if collision:
+            raise RuntimeError('Przywracanie zatrzymane: już zainstalowane aplikacje: ' + ', '.join(collision) + '. Niczego nie odinstalowano.')
+        restore_event('Uruchamianie przywracania YunoHost: ' + ', '.join(apps),
+                      phase='restore', status='running', percent=None)
+        run_restore_yunohost(name, apps)
+        success = True
+        restore_event('Przywrócono aplikacje: ' + ', '.join(apps),
+                      phase='complete', status='success', percent=100)
+    except Exception as exc:
+        restore_event(str(exc), phase='error', status='error', percent=None)
+    finally:
+        if success:
+            for path in created:
+                try:
+                    path.unlink()
+                except OSError:
+                    restore_event('Nie udało się usunąć lokalnego pliku tymczasowego: ' + path.name)
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        BACKUP_LOCK.release()
+
+
+@app.get('/api/restore/archives')
+def restore_archives():
+    storage_id = request.args.get('storage', '')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,49}', storage_id):
+        return jsonify(success=False, message='Wybierz magazyn.'), 400
+    try:
+        cfg = cfg_from_storage(storage_id)
+        entries = remote_archive_catalog(cfg)
+        installed = {a['id'] for a in actual_apps()} if on_yunohost() else set()
+        for record in entries:
+            record['conflicts'] = [a for a in record['apps'] if a in installed]
+        token = secrets.token_urlsafe(32)
+        session['restore_csrf'] = token
+        return jsonify(success=True, archives=entries, csrf=token)
+    except Exception as exc:
+        return jsonify(success=False, message=type(exc).__name__ + ': ' + str(exc)[:600]), 400
+
+
+@app.get('/api/restore/status')
+def restore_status():
+    with RESTORE_STATE_GUARD:
+        snapshot = {**RESTORE_STATE, 'log': list(RESTORE_STATE['log'])}
+    return jsonify(success=True, **snapshot)
+
+
+@app.post('/api/restore/start')
+def restore_start():
+    if not on_yunohost():
+        return jsonify(success=False, message='Przywracanie jest dostępne wyłącznie na YunoHost.'), 400
+    csrf = request.headers.get('X-Restore-CSRF', '')
+    expected = session.get('restore_csrf', '')
+    if not csrf or not expected or not hmac.compare_digest(csrf, expected):
+        return jsonify(success=False, message='Odśwież listę archiwów przed przywracaniem.'), 403
+    payload = request.get_json(silent=True) or {}
+    storage_id, name, apps = payload.get('storage'), payload.get('name'), payload.get('apps')
+    if not isinstance(storage_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,49}', storage_id):
+        return jsonify(success=False, message='Nieprawidłowy magazyn.'), 400
+    if not archive_name_ok(name) or not isinstance(apps, list) or not apps or len(apps) > 100 or any(
+            not isinstance(a, str) or not re.fullmatch(r'[A-Za-z0-9_]{1,100}', a) for a in apps) or len(apps) != len(set(apps)):
+        return jsonify(success=False, message='Nieprawidłowa lista aplikacji lub archiwum.'), 400
+    if read_state().get('status') in ('launching', 'running'):
+        return jsonify(success=False, message='Trwa aktualizacja aplikacji.'), 409
+    if not BACKUP_LOCK.acquire(blocking=False):
+        return jsonify(success=False, message='Trwa inna operacja kopii lub przywracania.'), 409
+    try:
+        cfg = cfg_from_storage(storage_id)
+        records = remote_archive_catalog(cfg, name)
+        if len(records) != 1 or not records[0]['complete'] or records[0]['message']:
+            raise ValueError('Niekompletne archiwum lub błędne metadane.')
+        archive = records[0]
+        if not set(apps).issubset(set(archive['apps'])):
+            raise ValueError('Nie wybrano aplikacji należących do archiwum.')
+        collision = sorted({a['id'] for a in actual_apps()}.intersection(apps))
+        if collision:
+            raise ValueError('Aplikacje już zainstalowane: ' + ', '.join(collision) + '. Nie zostaną nadpisane ani odinstalowane.')
+        if (BACKUP_DIR / (name + '.tar')).exists() or (BACKUP_DIR / (name + '.info.json')).exists():
+            raise ValueError('Lokalne archiwum o tej nazwie już istnieje. Nie zostanie nadpisane.')
+        session.pop('restore_csrf', None)
+        restore_event('Rozpoczynam przywracanie: ' + name, phase='prepare', status='running', reset=True)
+        threading.Thread(target=restore_worker,
+                         args=(storage_id, name, apps, archive['size'], archive['info_size']), daemon=True).start()
+        return jsonify(success=True, message='Rozpoczęto pobieranie i przywracanie kopii.')
+    except Exception as exc:
+        BACKUP_LOCK.release()
+        return jsonify(success=False, message=str(exc)[:700]), 400
 
 
 @app.get('/api/aplikacje')
@@ -683,7 +1093,7 @@ def updates_start():
     if not csrf or not expected_csrf or not hmac.compare_digest(csrf, expected_csrf):
         return jsonify(success=False, message='Nieprawidłowe potwierdzenie żądania. Odśwież panel.'), 403
     if BACKUP_LOCK.locked():
-        return jsonify(success=False, message='Trwa tworzenie kopii. Poczekaj na zakończenie.'), 409
+        return jsonify(success=False, message='Trwa tworzenie lub przywracanie kopii. Poczekaj na zakończenie.'), 409
     if not UPDATE_LAUNCH_LOCK.acquire(blocking=False):
         return jsonify(success=False, message='Uruchamianie aktualizacji już trwa.'), 409
     try:
@@ -763,20 +1173,107 @@ textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border
 #importLogPanel summary{cursor:pointer;user-select:none;padding:12px 14px;font-weight:600;background:#f1f5fa;color:#334d71}
 #importLogPanel pre{font:12px/1.55 Consolas,'Liberation Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:240px;min-height:65px;margin:0;padding:14px;color:#d8e7ff;background:#142136}
 #importLogPanel[hidden],#importProgress[hidden]{display:none}
-</style></head><body><header style="display:flex;align-items:center;gap:12px"><img id="appLogo" alt="" width="48" height="48" style="border-radius:9px;object-fit:contain"><span>YunoHost Backup Manager <small style="color:#cad5e5">0.5~ynh13</small></span></header><main>
-<section class="panel" id="updatePanel"><h2>Aktualizacje aplikacji</h2>
-<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh13</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
-<div id="updateMessage" class="message" style="display:none"></div>
-<div class="actions"><button type="button" id="checkUpdate" class="secondary">Sprawdź aktualizacje</button><button type="button" id="startUpdate" disabled>Aktualizuj aplikację</button></div>
-<div id="updateProgress" hidden>
-  <div class="update-progress-caption"><strong id="updateStage">Aktualizacja w toku</strong><span id="updatePhase">YunoHost wykonuje aktualizację…</span></div>
-  <div id="updateTrack" class="update-track" role="progressbar" aria-label="Stan aktualizacji" aria-valuetext="Trwa aktualizacja"><span class="update-progress-fill"></span></div>
-</div>
-<details id="updateLogPanel" hidden><summary>Podgląd przebiegu aktualizacji (log YunoHost)</summary>
-<pre id="updateLogText" role="log" aria-label="Log aktualizacji">Oczekiwanie na komunikaty YunoHost…</pre>
-<div class="actions"><button type="button" id="copyUpdateLog" class="secondary">Kopiuj log</button></div></details>
-<p><small>Aktualizacja korzysta z mechanizmu YunoHost. Podczas jej wykonywania panel może być chwilowo niedostępny. Zapisane magazyny i hasła pozostają w katalogu danych aplikacji.</small></p>
-</section>
+
+/* Panel 0.5~ynh15 — nawigacja kategoriami. */
+:root{--navy:#14263e;--navy-soft:#1c3552;--primary:#2d639c;--line:#e2e8f0;--text:#20334b;--muted:#637389}
+html{min-height:100%;scroll-behavior:smooth}
+body{background:#f2f5f9;color:var(--text)}
+.app-shell{display:grid;grid-template-columns:254px minmax(0,1fr);min-height:100vh}
+.app-sidebar{background:linear-gradient(175deg,#182c46 0%,#11223a 100%);color:#e9f1fc;display:flex;flex-direction:column;padding:26px 15px 20px;min-width:0;position:sticky;top:0;height:100vh;box-shadow:3px 0 20px #16294012}
+.sidebar-brand{display:flex;align-items:center;gap:12px;padding:5px 9px 27px;border-bottom:1px solid #ffffff19;margin-bottom:25px;min-width:0}
+.sidebar-brand img{width:48px;height:48px;flex:none;object-fit:contain;border-radius:10px;background:#0f2945}
+.brand-copy{min-width:0}.brand-copy strong{display:block;font-size:15px;line-height:1.35;letter-spacing:.1px}.brand-copy small{display:block;margin-top:6px;font-size:11px;color:#aebfd4;font-weight:normal}
+.sidebar-group-label{font-size:10px;letter-spacing:1.4px;font-weight:700;color:#899fb9;padding:0 13px;margin-bottom:12px}
+.sidebar-nav{display:flex;flex-direction:column;gap:6px}
+.nav-item{display:flex;align-items:center;gap:13px;padding:13px 14px;border-radius:9px;color:#ccd8e9;text-decoration:none;font-size:14px;font-weight:600;line-height:1.3;border:1px solid transparent;transition:background .15s ease,color .15s ease,border .15s ease}
+.nav-item svg{height:21px;width:21px;flex:none;opacity:.9}
+.nav-item:hover{background:#ffffff12;color:white}
+.nav-item:focus-visible{outline:2px solid #94cbf1;outline-offset:2px}
+.nav-item.active{background:#2b527d;color:#fff;border-color:#ffffff26;box-shadow:inset 3px 0 0 #67c2fa}
+.sidebar-bottom{margin-top:auto;padding:18px 12px 1px;font-size:11px;color:#a9b9ce;border-top:1px solid #ffffff15;display:flex;gap:8px;align-items:center}
+.sidebar-mark{background:#51b8a7;width:7px;height:7px;border-radius:50%;flex:none}
+.app-workspace{min-width:0}
+.workspace-topbar{min-height:68px;background:#fff;border-bottom:1px solid var(--line);padding:17px clamp(22px,4vw,56px);display:flex;align-items:center;justify-content:space-between;gap:12px;color:#637389;font-size:13px}
+.crumb-divider{display:inline-block;padding:0 9px;color:#a0aabb}
+.version-pill{color:#3d5877;background:#f1f5fa;border:1px solid #e1e8f1;border-radius:99px;padding:7px 12px;white-space:nowrap;font-size:12px;font-weight:600}
+.workspace-content{max-width:1160px;margin:0 auto;padding:34px clamp(22px,4vw,52px) 54px;min-width:0}
+.page-heading{margin-bottom:25px}.page-eyebrow{font-size:10px;letter-spacing:1.5px;font-weight:750;color:#71859c}.page-heading h1{font-size:30px;line-height:1.24;margin:8px 0 9px;color:#172b46}.page-heading p{font-size:14px;line-height:1.55;color:#6a798c;margin:0}
+.category-view[hidden]{display:none!important}
+.panel{border:1px solid #e5eaf0;box-shadow:0 5px 20px #2437500b;border-radius:12px;margin-bottom:20px;padding:26px}
+.panel h2{font-size:19px;line-height:1.35;color:#1e3653;margin-bottom:19px}
+input,select,textarea{border-color:#cbd6e3}
+input:focus,select:focus,textarea:focus{outline:2px solid #80b7ee;outline-offset:1px}
+button{background:#315f98}button:hover:not(:disabled){filter:brightness(1.07)}
+button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
+@media(max-width:900px){.app-shell{grid-template-columns:210px minmax(0,1fr)}.app-sidebar{padding:21px 10px}.sidebar-brand{gap:9px;padding:5px 8px 21px}.sidebar-brand img{width:40px;height:40px}.brand-copy strong{font-size:13px}.nav-item{padding:12px 10px;gap:10px}}
+@media(max-width:720px){
+ .app-shell{display:block}.app-sidebar{position:static;height:auto;padding:13px 14px 12px;box-shadow:none}
+ .sidebar-brand{margin:0 0 13px;padding:0 4px 10px;border-bottom:1px solid #ffffff1b}
+ .sidebar-brand img{width:36px;height:36px}.brand-copy strong{font-size:13px;line-height:1.2}.brand-copy small{margin-top:3px}
+ .sidebar-group-label,.sidebar-bottom{display:none}
+ .sidebar-nav{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+ .nav-item{justify-content:center;gap:7px;padding:11px 6px;text-align:center;font-size:12px}
+ .nav-item svg{width:17px;height:17px}.nav-item.active{box-shadow:inset 0 -3px 0 #67c2fa}
+ .workspace-topbar{min-height:48px;padding:10px 18px;font-size:12px}
+ .workspace-content{padding:25px 16px 42px}.page-heading{margin-bottom:20px}.page-heading h1{font-size:25px}
+ .panel{padding:19px 16px;border-radius:10px}.panel h2{font-size:18px}
+}
+@media(max-width:390px){.nav-item{font-size:11px;gap:5px}.nav-item svg{height:16px;width:16px}.version-pill{font-size:11px}}
+@media(prefers-reduced-motion:reduce){.nav-item{transition:none}html{scroll-behavior:auto}}
+
+/* Jednolity widok kopii i przywracania, wzorowany na sposobie pracy Proxmox. */
+.backup-toolbar{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;margin:5px 0 14px}
+.backup-toolbar .backup-storage-field{flex:1;min-width:220px}
+.backup-toolbar label{margin:0 0 7px}
+.backup-toolbar .actions{margin:0 0 2px}
+.archive-table input[type=radio]{width:auto;cursor:pointer}
+.archive-table tbody tr{cursor:pointer}
+.archive-table tbody tr:hover{background:#f5f8fc}
+.archive-table tbody tr.selected{background:#e8f2ff}
+.archive-table td{font-size:13px;vertical-align:middle}
+.archive-table .archive-name{font-weight:700;word-break:break-word}
+.archive-table .archive-apps{max-width:260px;color:#52657e}
+.archive-table .archive-status{font-size:12px;color:#39785e}
+.archive-table .archive-status.bad{color:#a33939}
+.archive-help{font-size:12px;color:#657286;margin-top:12px;line-height:1.5}
+.archive-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:15px}
+.archive-actions .archive-selection{margin-right:auto;font-size:13px;color:#657286}
+.backup-create-panel[hidden],#restoreProgress[hidden],#restoreLogPanel[hidden]{display:none}
+.backup-create-panel{border-top:1px solid #e5eaf0;padding-top:19px;margin-top:18px}
+#restoreProgress{margin-top:18px}
+#restoreLogPanel{margin-top:14px;border:1px solid #d8e0eb;border-radius:7px;overflow:hidden}
+#restoreLogPanel summary{cursor:pointer;user-select:none;padding:12px 14px;font-weight:600;background:#f1f5fa;color:#334d71}
+#restoreLogPanel pre{font:12px/1.55 Consolas,'Liberation Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:310px;min-height:70px;margin:0;padding:14px;color:#d8e7ff;background:#142136}
+.restore-dialog{border:1px solid #d7dfeb;border-radius:12px;padding:25px;width:min(560px,calc(100% - 30px));max-height:90vh;box-shadow:0 20px 70px #162b4780;background:white;color:#253954}
+.restore-dialog::backdrop{background:#172739ae}
+.restore-dialog h2{font-size:21px;margin:0 0 15px}
+.restore-dialog p{font-size:14px;line-height:1.5}
+.restore-app{display:block;font-weight:normal;border-bottom:1px solid #e5eaf0;padding:9px 2px;margin:0}
+.restore-app input{width:auto;vertical-align:middle;margin-right:8px}
+.restore-alert{background:#fff2de;color:#86520c;border-radius:7px;padding:12px;margin:12px 0;font-size:13px}
+.restore-alert.bad{background:#fbe5e5;color:#842a2a}
+.restore-dialog .actions{justify-content:flex-end}
+
+</style></head><body>
+<div class="app-shell">
+<aside class="app-sidebar" aria-label="Menu aplikacji">
+  <div class="sidebar-brand">
+    <img id="appLogo" alt="" width="48" height="48">
+    <div class="brand-copy"><strong>YunoHost<br>Backup Manager</strong><small>0.5~ynh15</small></div>
+  </div>
+  <div class="sidebar-group-label">ZARZĄDZANIE</div>
+  <nav class="sidebar-nav" aria-label="Kategorie">
+<a class="nav-item active" href="#magazyn" data-view="magazyn" aria-current="page"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="18" height="7" rx="2"/><rect x="3" y="13.5" width="18" height="7" rx="2"/><path d="M7.5 7h.01M7.5 17h.01M11 7h7M11 17h7"/></svg><span>Magazyn</span></a>
+<a class="nav-item" href="#kopie" data-view="kopie"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7.5V5a2 2 0 0 1 2-2h8l4 4v12a2 2 0 0 1-2 2h-2"/><path d="M15 3v5h5M3 16a6 6 0 1 0 2-4.5"/><path d="M3 11v5h5"/></svg><span>Kopie zapasowe</span></a>
+<a class="nav-item" href="#aktualizacja" data-view="aktualizacja"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V3m0 0L7.5 7.5M12 3l4.5 4.5M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg><span>Aktualizacja</span></a>
+  </nav>
+  <div class="sidebar-bottom"><span class="sidebar-mark"></span> Panel kopii zapasowych</div>
+</aside>
+<div class="app-workspace">
+  <header class="workspace-topbar"><span>YunoHost <span class="crumb-divider">/</span> Backup Manager</span><span class="version-pill">v0.5~ynh15</span></header>
+  <main class="workspace-content" id="mainContent">
+    <div class="page-heading"><span class="page-eyebrow">PANEL ZARZĄDZANIA</span><h1 id="viewTitle">Magazyn</h1><p id="viewDescription">Zarządzaj magazynami SMB/CIFS i połączeniami sieciowymi.</p></div>
+    <div class="category-view" id="view-magazyn" data-category="magazyn">
 <section class="panel"><h2>Magazyny SMB/CIFS</h2><div class="tablewrap"><table><thead><tr><th>ID</th><th>Serwer</th><th>Udział</th><th>Protokół</th><th>Akcje</th></tr></thead><tbody id="rows"><tr><td colspan="5">Wczytywanie...</td></tr></tbody></table></div></section>
 <section class="panel"><h2 id="formTitle">Dodaj magazyn SMB/CIFS</h2><form id="form">
 <div class="grid"><div><label for="id">ID magazynu</label><input id="id" name="id" placeholder="np. nas-backup" required></div>
@@ -789,29 +1286,93 @@ textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border
 <label for="subdirectory">Subdirectory (opcjonalnie)</label><input id="subdirectory" name="subdirectory" placeholder="np. kopie/yunohost"><p><small>Jeśli podkatalog nie istnieje, zostanie automatycznie utworzony podczas testu lub zapisu magazynu. Pozostaw puste, aby użyć katalogu głównego udziału.</small></p>
 <div class="actions"><button type="button" id="discover">Pobierz udziały</button><button type="button" id="test" class="secondary">Sprawdź odczyt i zapis</button><button type="submit" id="save">Zapisz magazyn</button><button type="button" id="cancel" class="secondary" hidden>Anuluj edycję</button></div></form>
 <div id="message" class="message"></div><p><small>Hasła są szyfrowane lokalnie. Podczas edycji puste hasło oznacza zachowanie poprzedniego. Aplikacja testowa działa wyłącznie lokalnie.</small></p></section>
-<section class="panel"><h2>Kopie zapasowe – wybór aplikacji</h2>
-<p><small>Na YunoHost aplikacje wykrywane są automatycznie. Na Windows pozostaje tryb lokalnego podglądu.</small></p>
+    </div>
+    <div class="category-view" id="view-kopie" data-category="kopie" hidden>
+<section class="panel" id="backupLibrary"><h2>Archiwa kopii zapasowych</h2>
+<div class="backup-toolbar"><div class="backup-storage-field"><label for="backupStorage">Magazyn kopii</label>
+<select id="backupStorage"><option value="">Wybierz magazyn</option></select></div>
+<div class="actions"><button type="button" class="secondary" id="reloadArchives">Odśwież listę</button><button type="button" id="showBackupForm">+ Nowa kopia</button></div></div>
+<div class="tablewrap"><table class="archive-table"><thead><tr><th></th><th>Archiwum</th><th>Data</th><th>Rozmiar</th><th>Aplikacje w kopii</th><th>Stan</th></tr></thead>
+<tbody id="archiveRows"><tr><td colspan="6">Wybierz magazyn, aby wyświetlić archiwa.</td></tr></tbody></table></div>
+<div class="archive-actions"><span class="archive-selection" id="archiveSelection">Nie wybrano archiwum.</span>
+<button type="button" id="restoreSelected" disabled>Przywróć wybraną kopię</button></div>
+<p class="archive-help">Wykaz pochodzi bezpośrednio z magazynu SMB. Przywracanie pobiera wybrane archiwum, a następnie uruchamia mechanizm YunoHost. Aplikacja nie usuwa ani nie nadpisuje istniejących instalacji.</p>
+<div id="archiveMessage" class="message"></div>
+<div class="backup-create-panel" id="backupCreatePanel" hidden>
+<h2>Nowa kopia zapasowa</h2>
+<p><small>Wybierz aplikacje. Archiwum zostanie zapisane na wskazanym wyżej magazynie SMB.</small></p>
 <div id="apps"><small>Wczytywanie aplikacji...</small></div>
-<label for="backupStorage">Magazyn docelowy</label><select id="backupStorage"><option value="">Wybierz magazyn</option></select>
-<div class="actions"><button type="button" id="runBackup" disabled>Wykonaj kopię</button></div>
-<div id="backupProgress" hidden>
-  <div class="update-progress-caption"><strong id="backupStage">Przygotowywanie kopii</strong><span id="backupPhase">Trwa praca…</span></div>
-  <div id="backupTrack" class="update-track" role="progressbar" aria-label="Postęp wykonywania kopii" aria-valuetext="Trwa praca"><span id="backupFill" class="update-progress-fill"></span></div>
-</div>
-<details id="backupLogPanel" hidden open><summary>Podgląd tworzenia kopii (log)</summary>
-<pre id="backupLogText" role="log" aria-label="Log tworzenia kopii">Oczekiwanie na uruchomienie…</pre></details>
+<div class="actions"><button type="button" id="runBackup" disabled>Utwórz kopię</button><button type="button" class="secondary" id="hideBackupForm">Anuluj</button></div>
 <details style="margin-top:22px"><summary>Importuj listę aplikacji z YunoHost (tryb lokalny)</summary>
 <p><small>Wklej wynik polecenia <code>yunohost app list --output-as json</code>. Nie podawaj haseł.</small></p>
 <textarea id="appsJson" placeholder='{"apps":[{"id":"wordpress","name":"Bałchan","domain_path":"strona.rpkj.ovh/organypiszczalkowe"}]}'></textarea>
 <div class="actions"><button type="button" id="importApps">Importuj aplikacje</button></div>
-<div id="importProgress" hidden>
-  <div class="update-progress-caption"><strong id="importStage">Importowanie aplikacji</strong><span id="importPhase">Przygotowanie danych…</span></div>
-  <div id="importTrack" class="update-track" role="progressbar" aria-label="Stan importu" aria-valuetext="Trwa import"><span class="update-progress-fill"></span></div>
-</div>
+<div id="importProgress" hidden><div class="update-progress-caption"><strong id="importStage">Importowanie aplikacji</strong><span id="importPhase">Przygotowanie danych…</span></div>
+<div id="importTrack" class="update-track" role="progressbar" aria-label="Stan importu" aria-valuetext="Trwa import"><span class="update-progress-fill"></span></div></div>
 <details id="importLogPanel" hidden open><summary>Podgląd przebiegu importu</summary><pre id="importLogText" role="log" aria-label="Log importu"></pre></details></details>
-<div id="appsMessage" class="message"></div><div id="backupMessage" class="message"></div></section>
-</main><script>
+<div id="appsMessage" class="message"></div></div></section>
+<section class="panel" id="operationsPanel"><h2>Postęp operacji i dziennik</h2>
+<div id="backupProgress" hidden>
+  <div class="update-progress-caption"><strong id="backupStage">Przygotowywanie kopii</strong><span id="backupPhase">Trwa praca…</span></div>
+  <div id="backupTrack" class="update-track" role="progressbar" aria-label="Postęp wykonywania kopii" aria-valuetext="Trwa praca"><span id="backupFill" class="update-progress-fill"></span></div>
+</div><details id="backupLogPanel" hidden open><summary>Podgląd tworzenia kopii (log)</summary><pre id="backupLogText" role="log" aria-label="Log tworzenia kopii">Oczekiwanie na uruchomienie…</pre></details>
+<div id="backupMessage" class="message"></div>
+<div id="restoreProgress" hidden>
+  <div class="update-progress-caption"><strong id="restoreStage">Przywracanie kopii</strong><span id="restorePhase">Trwa praca…</span></div>
+  <div id="restoreTrack" class="update-track" role="progressbar" aria-label="Postęp przywracania" aria-valuetext="Trwa przywracanie"><span id="restoreFill" class="update-progress-fill"></span></div>
+</div><details id="restoreLogPanel" hidden open><summary>Podgląd przywracania (log YunoHost)</summary><pre id="restoreLogText" role="log" aria-label="Log przywracania"></pre></details>
+<div id="restoreMessage" class="message"></div></section>
+<dialog class="restore-dialog" id="restoreDialog" aria-labelledby="restoreDialogHeading"><h2 id="restoreDialogHeading">Przywracanie archiwum</h2>
+<p id="restoreDialogName"></p><p>Wybierz aplikacje z archiwum:</p><div id="restoreApps"></div>
+<div class="restore-alert" id="restoreWarning">YunoHost nie pozwala przywrócić aplikacji na już zainstalowaną instancję. Istniejące aplikacje nie zostaną usunięte.</div>
+<label for="restorePhrase">Aby potwierdzić, wpisz <strong>PRZYWRÓĆ</strong></label>
+<input id="restorePhrase" type="text" autocomplete="off" placeholder="PRZYWRÓĆ" />
+<div class="actions"><button type="button" class="secondary" id="cancelRestore">Anuluj</button><button type="button" id="confirmRestore" class="danger" disabled>Rozpocznij przywracanie</button></div></dialog>
+    </div>
+    <div class="category-view" id="view-aktualizacja" data-category="aktualizacja" hidden>
+<section class="panel" id="updatePanel"><h2>Aktualizacje aplikacji</h2>
+<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh15</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
+<div id="updateMessage" class="message" style="display:none"></div>
+<div class="actions"><button type="button" id="checkUpdate" class="secondary">Sprawdź aktualizacje</button><button type="button" id="startUpdate" disabled>Aktualizuj aplikację</button></div>
+<div id="updateProgress" hidden>
+  <div class="update-progress-caption"><strong id="updateStage">Aktualizacja w toku</strong><span id="updatePhase">YunoHost wykonuje aktualizację…</span></div>
+  <div id="updateTrack" class="update-track" role="progressbar" aria-label="Stan aktualizacji" aria-valuetext="Trwa aktualizacja"><span class="update-progress-fill"></span></div>
+</div>
+<details id="updateLogPanel" hidden><summary>Podgląd przebiegu aktualizacji (log YunoHost)</summary>
+<pre id="updateLogText" role="log" aria-label="Log aktualizacji">Oczekiwanie na komunikaty YunoHost…</pre>
+<div class="actions"><button type="button" id="copyUpdateLog" class="secondary">Kopiuj log</button></div></details>
+<p><small>Aktualizacja korzysta z mechanizmu YunoHost. Podczas jej wykonywania panel może być chwilowo niedostępny. Zapisane magazyny i hasła pozostają w katalogu danych aplikacji.</small></p>
+</section>
+    </div>
+  </main>
+</div>
+</div><script>
 const $=id=>document.getElementById(id);let editing=null;let records=[];
+const categoryDetails={
+ magazyn:{title:'Magazyn',description:'Zarządzaj magazynami SMB/CIFS i połączeniami sieciowymi.'},
+ kopie:{title:'Kopie zapasowe',description:'Przeglądaj archiwa z magazynu, twórz nowe kopie i przywracaj wybrane aplikacje.'},
+ aktualizacja:{title:'Aktualizacja',description:'Sprawdź nową wersję aplikacji i zobacz przebieg aktualizacji.'}
+};
+function navigateCategory(name){
+ const section=categoryDetails[name]?name:'magazyn';
+ document.querySelectorAll('.category-view').forEach(el=>{el.hidden=el.dataset.category!==section});
+ document.querySelectorAll('.nav-item[data-view]').forEach(el=>{
+  const active=el.dataset.view===section;
+  el.classList.toggle('active',active);
+  if(active)el.setAttribute('aria-current','page');else el.removeAttribute('aria-current');
+ });
+ $('viewTitle').textContent=categoryDetails[section].title;
+ $('viewDescription').textContent=categoryDetails[section].description;
+ document.title=categoryDetails[section].title+' — YunoHost Backup Manager';
+}
+function routeCategory(){navigateCategory(decodeURIComponent(location.hash.slice(1)))}
+document.querySelectorAll('.nav-item[data-view]').forEach(link=>link.addEventListener('click',event=>{
+ event.preventDefault();const view=link.dataset.view;
+ if(location.hash.slice(1)!==view)location.hash=view;else navigateCategory(view);
+ window.scrollTo({top:0,behavior:'instant'});
+}));
+window.addEventListener('hashchange',routeCategory);
+routeCategory();
 $('appLogo').src=window.location.pathname.replace(/\/$/,'')+'/logo.png';
 function msg(ok,s){$('message').style.display='block';$('message').className='message '+(ok?'ok':'error');$('message').textContent=s}
 function data(){return Object.fromEntries(new FormData($('form')))}
@@ -819,7 +1380,7 @@ async function api(url,method='GET',payload){const base=window.location.pathname
 function busy(v){for(const x of ['discover','test','save'])$(x).disabled=v}
 function storageLocation(m){return m.share+(m.subdirectory?'/'+m.subdirectory.replace(/^\/+|\/+$/g,''):'')}
 function reset(){editing=null;$('form').reset();$('id').disabled=false;$('password').required=true;$('formTitle').textContent='Dodaj magazyn SMB/CIFS';$('cancel').hidden=true;$('share').innerHTML='<option value="">Najpierw pobierz udziały</option>'}
-async function refresh(){const x=await api('/api/magazyny');records=x.magazyny||[];const storage=$('backupStorage');const selected=storage.value;storage.replaceChildren(new Option('Wybierz magazyn',''));for(const m of records)storage.add(new Option(m.id+' ('+m.server+'/'+storageLocation(m)+')',m.id));storage.value=selected;const tbody=$('rows');tbody.replaceChildren();if(!records.length){const tr=tbody.insertRow();const td=tr.insertCell();td.colSpan=5;td.textContent='Brak zapisanych magazynów.';return}for(const m of records){const tr=tbody.insertRow();for(const v of [m.id,m.server,storageLocation(m),m.protocol==='auto'?'Auto':m.protocol.toUpperCase()])tr.insertCell().textContent=v;const td=tr.insertCell();for(const [title,fn,danger] of [['Edytuj',()=>edit(m.id),false],['Usuń',()=>remove(m.id),true]]){const b=document.createElement('button');b.textContent=title;b.className=danger?'danger':'secondary';b.onclick=fn;td.appendChild(b)}}}
+async function refresh(){const x=await api('/api/magazyny');records=x.magazyny||[];const storage=$('backupStorage');const selected=storage.value;storage.replaceChildren(new Option('Wybierz magazyn',''));for(const m of records)storage.add(new Option(m.id+' ('+m.server+'/'+storageLocation(m)+')',m.id));storage.value=selected|| (records.length===1?records[0].id:'');if(storage.value!==selected)refreshArchives().catch(e=>archiveNotice(false,e.message));const tbody=$('rows');tbody.replaceChildren();if(!records.length){const tr=tbody.insertRow();const td=tr.insertCell();td.colSpan=5;td.textContent='Brak zapisanych magazynów.';return}for(const m of records){const tr=tbody.insertRow();for(const v of [m.id,m.server,storageLocation(m),m.protocol==='auto'?'Auto':m.protocol.toUpperCase()])tr.insertCell().textContent=v;const td=tr.insertCell();for(const [title,fn,danger] of [['Edytuj',()=>edit(m.id),false],['Usuń',()=>remove(m.id),true]]){const b=document.createElement('button');b.textContent=title;b.className=danger?'danger':'secondary';b.onclick=fn;td.appendChild(b)}}}
 function edit(id){const m=records.find(x=>x.id===id);if(!m)return;editing=id;for(const k of ['id','server','username','domain','protocol','subdirectory'])$(k).value=m[k]||'';$('id').disabled=true;$('password').value='';$('password').required=false;$('share').replaceChildren(new Option(m.share,m.share));$('formTitle').textContent='Edytuj magazyn: '+id;$('cancel').hidden=false;msg(true,'Edytujesz magazyn. Puste hasło zachowa poprzednie.');$('form').scrollIntoView({behavior:'smooth'})}
 async function remove(id){if(!confirm('Usunąć magazyn '+id+'?'))return;const x=await api('/api/magazyny/'+encodeURIComponent(id),'DELETE');msg(x.success,x.message);if(x.success){if(editing===id)reset();await refresh()}}
 $('cancel').onclick=()=>{reset();msg(true,'Anulowano edycję.')};
@@ -865,12 +1426,128 @@ $('importApps').onclick=async()=>{
   output.className='message error';output.textContent='Import nieudany: '+e.message;
  }finally{button.disabled=false}
 };
+
+// Biblioteka archiwów i przywracanie w tym samym widoku (jak magazyn kopii w Proxmox).
+let archiveRecords=[], selectedArchive='', restoreToken='', restoreRunning=false, backupWasRunning=false;
+let activeRestore=null, lastRestoreFinished='';
+function archiveNotice(ok,text){const box=$('archiveMessage');box.style.display='block';box.className='message '+(ok?'ok':'error');box.textContent=text}
+function readableSize(bytes){if(!Number.isFinite(bytes))return '—';return bytes>=1073741824?(bytes/1073741824).toFixed(2)+' GiB':(bytes/1048576).toFixed(1)+' MiB'}
+function archiveTime(a){if(typeof a.created_at==='number')return new Date(a.created_at*1000).toLocaleString('pl-PL');
+ const m=a.name.match(/_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_/);
+ return m?`${m[3]}.${m[2]}.${m[1]} ${m[4]}:${m[5]}`:'—'}
+function showArchiveRows(){const target=$('archiveRows');target.replaceChildren();
+ if(!archiveRecords.length){const row=target.insertRow();const td=row.insertCell();td.colSpan=6;td.textContent='Nie znaleziono archiwów w wybranym magazynie.';}
+ for(const item of archiveRecords){
+  const row=target.insertRow();row.classList.toggle('selected',item.name===selectedArchive);
+  const radio=document.createElement('input');radio.type='radio';radio.name='archive-choice';radio.value=item.name;
+  radio.checked=item.name===selectedArchive;radio.setAttribute('aria-label','Wybierz '+item.name);
+  row.insertCell().append(radio);
+  const name=row.insertCell();name.className='archive-name';name.textContent=item.name;
+  row.insertCell().textContent=archiveTime(item);
+  row.insertCell().textContent=readableSize(item.size);
+  const apps=row.insertCell();apps.className='archive-apps';apps.textContent=item.apps?.length?item.apps.map(id=>(item.app_names&&item.app_names[id])||id).join(', '):'Brak informacji';
+  const status=row.insertCell();status.className='archive-status'+((!item.complete||item.message)?' bad':'');
+  status.textContent=item.message||(item.conflicts?.length?'Aplikacja już zainstalowana':'Gotowe');
+  const choose=()=>{selectedArchive=item.name;showArchiveRows()};
+  row.addEventListener('click',choose);radio.addEventListener('change',choose);
+ }
+ const selected=archiveRecords.find(a=>a.name===selectedArchive);
+ const okay=Boolean(selected&&selected.complete&&!selected.message&&selected.apps?.length&&!restoreRunning);
+ $('restoreSelected').disabled=!okay;
+ $('archiveSelection').textContent=selected?'Wybrano: '+selected.name:'Nie wybrano archiwum.';
+}
+async function refreshArchives(){
+ const storage=$('backupStorage').value;
+ selectedArchive='';archiveRecords=[];restoreToken='';
+ const target=$('archiveRows');target.replaceChildren();
+ if(!storage){const r=target.insertRow();const td=r.insertCell();td.colSpan=6;td.textContent='Wybierz magazyn.';
+  $('restoreSelected').disabled=true;$('archiveSelection').textContent='Nie wybrano archiwum.';return}
+ const row=target.insertRow();const td=row.insertCell();td.colSpan=6;td.textContent='Odczytywanie archiwów z magazynu SMB…';
+ $('reloadArchives').disabled=true;$('restoreSelected').disabled=true;
+ try{
+  const result=await api('/api/restore/archives?storage='+encodeURIComponent(storage));
+  if(!result.success)throw new Error(result.message||'Nie udało się pobrać listy.');
+  archiveRecords=result.archives||[];restoreToken=result.csrf||'';
+  showArchiveRows();
+  $('archiveMessage').style.display='none';
+ }catch(e){archiveRecords=[];target.replaceChildren();const r=target.insertRow();const td=r.insertCell();td.colSpan=6;td.textContent='Nie udało się pobrać listy archiwów.';archiveNotice(false,e.message);}
+ finally{$('reloadArchives').disabled=false}
+}
+$('backupStorage').addEventListener('change',()=>refreshArchives());
+$('reloadArchives').onclick=()=>refreshArchives();
+$('showBackupForm').onclick=()=>{$('backupCreatePanel').hidden=false;$('showBackupForm').disabled=true;};
+$('hideBackupForm').onclick=()=>{if(backupWasRunning)return;$('backupCreatePanel').hidden=true;$('showBackupForm').disabled=false;};
+function syncRestoreDialog(){
+ const selected=[...$('restoreApps').querySelectorAll('input:checked')];
+ const forbidden=selected.some(el=>el.dataset.conflict==='1');
+ const valid=$('restorePhrase').value.trim()==='PRZYWRÓĆ' && selected.length>0 && !forbidden && !restoreRunning;
+ $('confirmRestore').disabled=!valid;
+ const note=$('restoreWarning');
+ note.classList.toggle('bad',forbidden);
+ note.textContent=forbidden?'Wybrane aplikacje już istnieją na serwerze. Przywracanie ich bez wcześniejszego usunięcia nie jest dostępne w YunoHost. Wtyczka niczego nie odinstaluje.':
+  'Przywracanie zmienia instalację YunoHost. Upewnij się, że wybrano właściwe archiwum i aplikacje. Pliki na magazynie SMB pozostaną bez zmian.';
+}
+$('restoreSelected').onclick=()=>{
+ activeRestore=archiveRecords.find(x=>x.name===selectedArchive);
+ if(!activeRestore||!activeRestore.apps?.length||activeRestore.message)return;
+ $('restoreDialogName').textContent='Archiwum: '+activeRestore.name+'  |  '+readableSize(activeRestore.size);
+ const host=$('restoreApps');host.replaceChildren();
+ for(const name of activeRestore.apps){const label=document.createElement('label');label.className='restore-app';
+  const input=document.createElement('input');input.type='checkbox';input.value=name;
+  input.dataset.conflict=(activeRestore.conflicts||[]).includes(name)?'1':'0';
+  input.checked=input.dataset.conflict!=='1';
+  const span=document.createElement('span');span.textContent=((activeRestore.app_names&&activeRestore.app_names[name])||name)+' ('+name+')'+(input.dataset.conflict==='1'?' — już zainstalowana':'');
+  label.append(input,span);host.append(label);input.addEventListener('change',syncRestoreDialog);}
+ $('restorePhrase').value='';syncRestoreDialog();$('restoreDialog').showModal();
+};
+$('restorePhrase').addEventListener('input',syncRestoreDialog);
+$('cancelRestore').onclick=()=>$('restoreDialog').close();
+$('confirmRestore').onclick=async()=>{
+ const apps=[...$('restoreApps').querySelectorAll('input:checked')].map(i=>i.value);
+ if(!apps.length||!activeRestore||!restoreToken||$('restorePhrase').value.trim()!=='PRZYWRÓĆ')return;
+ $('confirmRestore').disabled=true;
+ try{
+  const base=window.location.pathname.replace(/\/$/,'');
+  const reply=await fetch(base+'/api/restore/start',{method:'POST',headers:{'Content-Type':'application/json','X-Restore-CSRF':restoreToken},
+   body:JSON.stringify({storage:$('backupStorage').value,name:activeRestore.name,apps})});
+  const result=await reply.json();
+  if(!result.success)throw new Error(result.message||'Nie udało się rozpocząć przywracania.');
+  $('restoreDialog').close();restoreRunning=true;restoreToken='';
+  const box=$('restoreMessage');box.style.display='block';box.className='message ok';box.textContent=result.message;
+  $('restoreLogPanel').open=true;await restorePoll();
+ }catch(e){archiveNotice(false,e.message);$('restoreDialog').close()}
+};
+async function restorePoll(){
+ const s=await api('/api/restore/status');
+ const previousRestore=restoreRunning;restoreRunning=s.status==='running';
+ const p=$('restoreProgress'),l=$('restoreLogPanel'),track=$('restoreTrack'),fill=$('restoreFill');
+ if(s.status==='idle'){p.hidden=true;l.hidden=true;return;}
+ p.hidden=false;l.hidden=false;track.className='update-track';fill.style.width='';
+ $('restoreStage').textContent=({prepare:'Przygotowanie',download:'Pobieranie kopii z SMB',restore:'Przywracanie przez YunoHost',complete:'Przywracanie zakończone',error:'Błąd przywracania'})[s.phase]||'Przywracanie kopii';
+ if(s.status==='success'){track.classList.add('complete');$('restorePhase').textContent='Gotowe';}
+ else if(s.status==='error'){track.classList.add('failed');$('restorePhase').textContent='Sprawdź log';}
+ else if(s.phase==='download'&&typeof s.percent==='number'){
+  track.classList.add('measured');fill.style.width=Math.min(100,Math.max(0,s.percent))+'%';
+  $('restorePhase').textContent=s.percent+'% pobierania ('+readableSize(s.done_bytes)+' / '+readableSize(s.total_bytes)+')';
+ }else $('restorePhase').textContent='Śledź rzeczywisty log poniżej';
+ const out=$('restoreLogText'),t=(s.log||[]).join('\n');
+ if(out.textContent!==t){const follow=out.scrollHeight-out.scrollTop-out.clientHeight<45;
+  out.textContent=t||'Oczekiwanie na komunikaty…';if(follow)out.scrollTop=out.scrollHeight;}
+ const msg=$('restoreMessage');msg.style.display='block';msg.className='message '+(s.status==='error'?'error':'ok');msg.textContent=s.message;
+ if(s.status==='success'||s.status==='error'){
+  const final=(s.log||[]).slice(-1)[0]||s.message;
+  if(lastRestoreFinished!==final){lastRestoreFinished=final;refreshArchives().catch(()=>{});}
+ }
+ if(previousRestore!==restoreRunning)showArchiveRows();
+}
+
 async function backupPoll(){
- const s=await api('/api/backup/status');const btn=$('runBackup');btn.disabled=!s.available||s.status==='running';
- const box=$('backupMessage');box.style.display='block';box.className='message '+(s.status==='error'?'error':'ok');
+ const s=await api('/api/backup/status');const btn=$('runBackup');btn.disabled=!s.available||s.status==='running'||restoreRunning;
+ const box=$('backupMessage');box.style.display=s.status==='idle'?'none':'block';box.className='message '+(s.status==='error'?'error':'ok');
  box.textContent=s.available?s.message:'Tryb Windows: kopie będą dostępne po uruchomieniu aplikacji na YunoHost.';
  const progress=$('backupProgress'),logPanel=$('backupLogPanel'),track=$('backupTrack'),fill=$('backupFill');
  if(s.status==='idle'){progress.hidden=true;logPanel.hidden=true;return}
+ if(s.status==='running')backupWasRunning=true;else if(backupWasRunning && s.status==='success'){backupWasRunning=false;refreshArchives().catch(()=>{})}else if(s.status==='error')backupWasRunning=false;
  progress.hidden=false;logPanel.hidden=false;track.className='update-track';fill.style.width='';
  const names={prepare:'Sprawdzanie miejsca',create:'Tworzenie archiwum YunoHost',
               transfer:'Transfer i weryfikacja SMB',cleanup:'Usuwanie kopii lokalnej',
@@ -902,7 +1579,7 @@ $('runBackup').onclick=async()=>{
  if(!apps.length||!storage){alert('Wybierz aplikacje i magazyn.');return}
  if(!confirm('Wykonać kopię '+apps.join(', ')+' na magazyn '+storage+'?'))return;
  const r=await api('/api/backup/start','POST',{apps,storage});
- if(!r.success)alert(r.message);await backupPoll();
+ if(!r.success)alert(r.message);else{document.getElementById('backupCreatePanel').hidden=false;backupWasRunning=true}await backupPoll();
 };
 let updateToken='';let availableUpdate='';let updating=false;
 let updateLogOffset=0, updateLogLoading=false, updatePollLoading=false, updateLastRun='';
@@ -1011,6 +1688,7 @@ async function pollUpdates(){
 checkUpdates();pollUpdates();setInterval(pollUpdates,1700);
 backupPoll().catch(e=>msg(false,e.message));
 setInterval(()=>backupPoll().catch(()=>{}),3000);
+restorePoll().catch(()=>{});setInterval(()=>restorePoll().catch(()=>{}),3000);
 refreshApps().catch(e=>msg(false,e.message));
 refresh().catch(e=>msg(false,e.message));
 </script></body></html>'''

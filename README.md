@@ -1,6 +1,21 @@
-# YunoHost Backup Manager — 0.5~ynh13 (wersja testowa)
+# YunoHost Backup Manager — 0.5~ynh15 (wersja testowa)
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh13**
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh15**
+
+## Zmiany w 0.5~ynh15 — kopie i przywracanie jak w Proxmox
+
+W zakładce **Kopie zapasowe** znajduje się jeden wspólny panel:
+
+1. Wybór magazynu SMB/CIFS, odświeżanie i przegląd jego istniejących archiwów.
+2. Tabela kopii z nazwą, datą, rzeczywistym rozmiarem, nazwami aplikacji z `.info.json` i stanem kompletności.
+3. **+ Nowa kopia** otwiera formularz wyboru aplikacji, a **Przywróć wybraną kopię** otwiera podgląd archiwum z listą aplikacji.
+4. Przywracanie wymaga świadomego potwierdzenia `PRZYWRÓĆ`. Pobiera oba pliki (`.tar` i `.info.json`) z wybranego magazynu, pokazuje postęp pobierania i rzeczywisty log przywracania YunoHost. Nie usuwa zdalnego archiwum.
+5. Tworzenie i przywracanie korzystają ze wspólnej blokady — nie mogą działać równolegle ani z aktualizacją wtyczki.
+6. YunoHost **nie przywraca aplikacji na już zainstalowaną instancję**. Takie aplikacje są oznaczone na liście, a przywracanie jest bezpiecznie blokowane. Wtyczka nigdy nie odinstalowuje ich automatycznie.
+7. Po udanej operacji lokalnie pobrane pliki są usuwane, a w razie niepowodzenia zostają do analizy/próby naprawy. Żadne istniejące lokalne archiwum nie jest nadpisywane.
+8. Zachowano trzy kategorie w menu: Magazyn, Kopie zapasowe, Aktualizacja. Ikona pozostaje dołączona do pakietu.
+
+**Uwaga:** To wersja testowa. Przeprowadzono testy lokalne z emulowanym SMB oraz symulowane interakcje w przeglądarce. Przywracania prawdziwej instalacji YunoHost nie testowano i należy je najpierw przeprowadzić na środowisku testowym. Wtyczka nie zmienia konfiguracji Proxmoxa, Tailscale, OMV ani systemu poza operacjami wykonywanymi przez YunoHost na żądanie użytkownika.
 
 ## Zmiany w 0.5~ynh13
 
