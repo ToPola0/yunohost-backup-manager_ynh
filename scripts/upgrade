@@ -4,12 +4,13 @@ source /usr/share/yunohost/helpers
 cp ../sources/app.py "$install_dir/app.py"
 cp ../sources/cron_schedule.py "$install_dir/cron_schedule.py"
 cp ../sources/resumable_chunks.py "$install_dir/resumable_chunks.py"
+cp ../sources/orphan_cleanup.py "$install_dir/orphan_cleanup.py"
 cp ../sources/smb_transport.py "$install_dir/smb_transport.py"
 cp ../sources/updater.py "$install_dir/updater.py"
 cp ../sources/update_runner.py "$install_dir/update_runner.py"
 cp ../sources/logo.png "$install_dir/logo.png"
 # Fatal when YunoHost does not replace the actual installed files.
-for file in app.py cron_schedule.py resumable_chunks.py smb_transport.py updater.py update_runner.py logo.png; do
+for file in app.py cron_schedule.py resumable_chunks.py orphan_cleanup.py smb_transport.py updater.py update_runner.py logo.png; do
     if ! cmp -s "../sources/$file" "$install_dir/$file"; then
         echo "BŁĄD: instalowany plik $file nie jest zgodny z pakietem aktualizacji." >&2
         exit 1

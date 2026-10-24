@@ -25,6 +25,7 @@ import datetime
 import fcntl
 from updater import APP_VERSION, check_remote, read_state, write_state, read_log_chunk, LOG_FILE
 from cron_schedule import CronSpec, next_occurrence
+from orphan_cleanup import scan_partial, delete_partial, validate_own_backup
 from resumable_chunks import (SMBStore, CHUNK_SIZE, FORMAT, MAX_REPORT,
     make_manifest, manifest_validate, synchronize_chunks, save_manifest,
     read_manifest, upload_report, verified_report, manifest_bytes, catalog_chunked,
@@ -333,6 +334,46 @@ BACKUP_REPORT = None  # only one backup can run while BACKUP_LOCK is held
 TRANSFER_JOB_FILE = DATA / 'pending_transfer.json'
 TRANSFER_FILE_LOCK = threading.RLock()
 TRANSFER_RETRY_SECONDS = 5
+ABANDONED_FILE = DATA / 'abandoned_transfers.json'
+ABANDONED_GUARD = threading.RLock()
+
+
+def read_abandoned():
+    with ABANDONED_GUARD:
+        if not ABANDONED_FILE.is_file():
+            return {}
+        try:
+            raw = json.loads(ABANDONED_FILE.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError('Nie można odczytać rejestru anulowanych kopii.') from exc
+        if not isinstance(raw, dict):
+            raise RuntimeError('Uszkodzony rejestr anulowanych kopii.')
+        return {k: v for k, v in raw.items() if isinstance(v, dict)
+                and isinstance(k, str) and k == v.get('name')}
+
+
+def write_abandoned(rows):
+    with ABANDONED_GUARD:
+        tmp = ABANDONED_FILE.with_suffix('.' + uuid.uuid4().hex + '.tmp')
+        try:
+            with open(tmp, 'x', encoding='utf-8') as out:
+                json.dump(rows, out, ensure_ascii=False, indent=2)
+                out.flush()
+                os.fsync(out.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, ABANDONED_FILE)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def remember_abandoned(job):
+    name = validate_own_backup(job['name'])
+    with ABANDONED_GUARD:
+        rows = read_abandoned()
+        rows[name] = {'name': name, 'storage': job['storage'],
+                      'cancelled_at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')}
+        write_abandoned(rows)
+
 
 
 def atomic_transfer_state(data):
@@ -408,7 +449,7 @@ REPORT_MAX_SIZE = 1024 * 1024
 BACKUP_STATE = {'status': 'idle', 'phase': 'idle', 'percent': None,
                 'message': 'Brak uruchomionej kopii.', 'details': [],
                 'done_bytes': 0, 'total_bytes': 0, 'log': [],
-                'archive_folder': '', 'chunks': []}
+                'archive_folder': '', 'chunks': [], 'parallel': 1, 'upload_speed': None, 'parallel_samples': {}}
 
 
 def backup_event(message, phase=None, status=None, percent=None, reset=False):
@@ -416,7 +457,7 @@ def backup_event(message, phase=None, status=None, percent=None, reset=False):
     with BACKUP_STATE_GUARD:
         if reset:
             BACKUP_STATE.update(log=[], done_bytes=0, total_bytes=0, details=[],
-                                archive_folder='', chunks=[])
+                                archive_folder='', chunks=[], parallel=1, upload_speed=None, parallel_samples={})
         BACKUP_STATE['message'] = message
         BACKUP_STATE['percent'] = percent
         if phase is not None:
@@ -725,9 +766,12 @@ def transfer_resumable(job):
         BACKUP_REPORT = {'events': list(job.get('initial_log', []))}
     while True:
         if transfer_cancelled(name):
+            # Keep the cancelled job in the app's own registry. Users can
+            # remove its exact local archive and incomplete SMB parts later.
+            remember_abandoned(job)
             with TRANSFER_FILE_LOCK:
                 TRANSFER_JOB_FILE.unlink(missing_ok=True)
-            backup_event('Operator anulował przesyłanie. Pliki lokalne pozostawiono do ręcznej kontroli.',
+            backup_event('Operator anulował transfer. Pozostałości można usunąć w panelu kopii.',
                          phase='cancelled', status='cancelled')
             return
         try:
@@ -755,9 +799,26 @@ def transfer_resumable(job):
                          phase='transfer', status='running', percent=0)
             dialect = chunk_dialect(cfg)
             workers = 3 if dialect == 'smb2' else 1
-            backup_event(('SMB2/3: maksymalnie 3 części przesyłane i weryfikowane równocześnie.'
-                          if workers > 1 else 'SMB1: przesyłanie i weryfikacja części kolejno.'),
+            backup_event(('SMB2/3: automatyczny dobór 1–3 jednoczesnych transferów na podstawie '
+                          'rzeczywistej przepustowości uploadu.' if workers > 1
+                          else 'SMB1: przesyłanie i weryfikacja części kolejno.'),
                          phase='transfer', status='running', percent=0)
+            previous_width = [None]
+
+            def on_adapt(width, rate, measured):
+                with BACKUP_STATE_GUARD:
+                    BACKUP_STATE['parallel'] = width
+                    BACKUP_STATE['upload_speed'] = round(rate / 1048576, 2) if rate is not None else None
+                    BACKUP_STATE['parallel_samples'] = {str(k): round(v / 1048576, 2)
+                                                         for k, v in measured.items()}
+                if rate is not None:
+                    backup_event(f'Pomiar uploadu ({width} '+ ('transfer' if width == 1 else 'transfery') + f'): {rate / 1048576:.2f} MiB/s. '
+                                 'Dobieram liczbę połączeń na podstawie wyników.',
+                                 phase='transfer', status='running', percent=BACKUP_STATE.get('percent'))
+                elif width != previous_width[0]:
+                    backup_event(f'Automatycznie ustawiono {width} '+('transfer' if width == 1 else 'transfery')+' SMB.',
+                                 phase='transfer', status='running', percent=BACKUP_STATE.get('percent'))
+                previous_width[0] = width
             done = [0]
             partial_total = [0]
             partial_by_chunk = {(row['role'], row['number']): 0 for row in rows}
@@ -826,7 +887,8 @@ def transfer_resumable(job):
                 summary = synchronize_chunks(store, name, files, manifest,
                      on_verified=verified, cancelled=lambda: transfer_cancelled(name),
                      on_progress=live_progress, workers=workers,
-                     store_factory=(lambda: open_chunk_store(cfg, 'smb2')) if workers > 1 else None)
+                     store_factory=(lambda: open_chunk_store(cfg, 'smb2')) if workers > 1 else None,
+                     adaptive=(workers > 1), on_adapt=on_adapt)
                 if transfer_cancelled(name):
                     raise InterruptedError('Operator przerwał wykonywanie kopii.')
                 backup_event(f'Zweryfikowano wszystkie części. Wysłano: {summary["sent"]}; '
@@ -942,6 +1004,7 @@ def resume_pending_transfer():
         if not job:
             return
         if job.get('cancel_requested'):
+            remember_abandoned(job)
             with TRANSFER_FILE_LOCK:
                 TRANSFER_JOB_FILE.unlink(missing_ok=True)
             return
@@ -969,9 +1032,142 @@ def backup_cancel():
             return jsonify(success=False, message='Nie ma transferu do anulowania.'), 409
         job['cancel_requested'] = True
         atomic_transfer_state(job)
-        return jsonify(success=True, message='Zlecono zatrzymanie transferu. Lokalne archiwum pozostanie na dysku.')
+        return jsonify(success=True, message='Zlecono zatrzymanie transferu. Pozostałości można potem usunąć z panelu kopii.')
     except Exception as exc:
         return jsonify(success=False, message=str(exc)[:300]), 400
+
+
+def leftover_local_items():
+    """Only exact app-created YunoHost archives, never arbitrary local files."""
+    results = {}
+    if not BACKUP_DIR.is_dir():
+        return results
+    for suffix in ('.tar', '.info.json'):
+        for path in BACKUP_DIR.glob('ybm_*' + suffix):
+            if path.is_symlink() or not path.is_file() or path.parent != BACKUP_DIR:
+                continue
+            name = path.name[:-len(suffix)]
+            try:
+                validate_own_backup(name)
+            except ValueError:
+                continue
+            record = results.setdefault(name, {'name': name, 'local': False, 'size': 0})
+            record['local'] = True
+            record['size'] += path.stat().st_size
+    return results
+
+
+@app.get('/api/backup/leftovers')
+def backup_leftovers():
+    storage_id = request.args.get('storage', '')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,49}', storage_id):
+        return jsonify(success=False, message='Wybierz magazyn SMB.'), 400
+    registry = read_abandoned()
+    active = pending_transfer()
+    active_name = active.get('name') if active else None
+    items = leftover_local_items()
+    for name, job in registry.items():
+        if job.get('storage') == storage_id and name != active_name:
+            items.setdefault(name, {'name': name, 'local': False, 'size': 0})
+    remote_error = ''
+    try:
+        cfg = cfg_from_storage(storage_id)
+        for name in chunk_read(cfg, scan_partial):
+            row = items.setdefault(name, {'name': name, 'local': False, 'size': 0})
+            row['remote'] = True
+    except Exception as exc:
+        remote_error = f'{type(exc).__name__}: {str(exc)[:220]}'
+    data = []
+    for name, row in sorted(items.items(), reverse=True):
+        if name == active_name:
+            continue
+        row['remote'] = bool(row.get('remote'))
+        row['storage'] = storage_id
+        row['cancelled'] = name in registry
+        # Only show local files that actually exist, or remote incomplete data.
+        if row['local'] or row['remote']:
+            data.append(row)
+    token = session.get('leftover_csrf') or secrets.token_urlsafe(32)
+    session['leftover_csrf'] = token
+    return jsonify(success=True, records=data[:250], csrf=token, remote_error=remote_error)
+
+
+@app.post('/api/backup/leftovers/delete')
+def backup_leftovers_delete():
+    expected = session.get('leftover_csrf', '')
+    supplied = request.headers.get('X-Leftover-CSRF', '')
+    if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+        return jsonify(success=False, message='Odśwież listę pozostałości przed usuwaniem.'), 403
+    payload = request.get_json(silent=True) or {}
+    name = payload.get('name')
+    storage_id = payload.get('storage')
+    if payload.get('confirmation') != 'USUŃ':
+        return jsonify(success=False, message='Potwierdź usunięcie słowem USUŃ.'), 400
+    try:
+        validate_own_backup(name)
+    except ValueError as exc:
+        return jsonify(success=False, message=str(exc)), 400
+    if not isinstance(storage_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,49}', storage_id):
+        return jsonify(success=False, message='Nieprawidłowy magazyn.'), 400
+    local, remote = payload.get('local') is True, payload.get('remote') is True
+    if not (local or remote):
+        return jsonify(success=False, message='Nie wskazano plików do usunięcia.'), 400
+    if read_state().get('status') in ('launching', 'running'):
+        return jsonify(success=False, message='Trwa aktualizacja aplikacji.'), 409
+    if pending_transfer():
+        return jsonify(success=False, message='Trwa lub oczekuje transfer kopii.'), 409
+    if not BACKUP_LOCK.acquire(blocking=False):
+        return jsonify(success=False, message='Trwa inna operacja kopii.'), 409
+    try:
+        if RESTORE_STATE.get('status') == 'running':
+            return jsonify(success=False, message='Trwa przywracanie kopii.'), 409
+        # First remote incomplete files, then local source. A failed remote
+        # cleanup never deletes the last local archive implicitly.
+        cleaned = []
+        if remote:
+            cfg = cfg_from_storage(storage_id)
+            if cfg['protocol'] == 'smb1':
+                with SMB_LOCK:
+                    with open_chunk_store(cfg, 'smb1') as store:
+                        cleaned = delete_partial(store, name, storage_id)
+            elif cfg['protocol'] == 'smb2':
+                with open_chunk_store(cfg, 'smb2') as store:
+                    cleaned = delete_partial(store, name, storage_id)
+            else:
+                # Read/write dialect choice is resolved before destructive
+                # operations. Never fallback to SMB1 after partial deletion.
+                dialect = chunk_dialect(cfg)
+                if dialect == 'smb1':
+                    with SMB_LOCK:
+                        with open_chunk_store(cfg, 'smb1') as store:
+                            cleaned = delete_partial(store, name, storage_id)
+                else:
+                    with open_chunk_store(cfg, 'smb2') as store:
+                        cleaned = delete_partial(store, name, storage_id)
+        removed_local = []
+        if local:
+            # Whitelist exactly two files, without following symlinks.
+            for suffix in ('.tar', '.info.json'):
+                target = BACKUP_DIR / (name + suffix)
+                if target.is_symlink():
+                    raise RuntimeError('Wykryto dowiązanie symboliczne; operację przerwano.')
+                if target.is_file():
+                    target.unlink()
+                    removed_local.append(target.name)
+        with ABANDONED_GUARD:
+            rows = read_abandoned()
+            if name in rows and not any((BACKUP_DIR / (name + suffix)).is_file()
+                                            for suffix in ('.tar', '.info.json')):
+                rows.pop(name)
+                write_abandoned(rows)
+        session.pop('leftover_csrf', None)
+        return jsonify(success=True, message=('Usunięto pozostałości: ' + name),
+                       removed_remote=cleaned, removed_local=removed_local)
+    except Exception as exc:
+        return jsonify(success=False, message='Nie usunięto wszystkich pozostałości: ' +
+                       str(exc)[:350] + '. Odśwież listę i spróbuj ponownie.'), 400
+    finally:
+        BACKUP_LOCK.release()
 
 
 @app.get('/api/backup/status')
@@ -2280,6 +2476,7 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 <div id="backupChunkPanel" class="backup-chunk-panel" hidden>
   <div class="backup-chunk-top"><strong>Fragmenty archiwum w jednym katalogu SMB</strong><span id="backupChunkCount">0 / 0</span></div>
   <div class="backup-folder">Katalog: <code id="backupChunkFolder"></code></div>
+  <p id="backupThroughput" class="archive-help">Równoległe transfery: 1 — pomiar przepustowości…</p>
   <div class="tablewrap backup-chunk-scroll"><table class="backup-chunk-table"><thead><tr><th>Część</th><th>Rozmiar</th><th>Stan</th><th>Postęp części</th></tr></thead><tbody id="backupChunkRows"></tbody></table></div>
 </div>
 <details id="backupLogPanel" hidden open><summary>Podgląd tworzenia kopii (log)</summary><pre id="backupLogText" role="log" aria-label="Log tworzenia kopii">Oczekiwanie na uruchomienie…</pre></details>
@@ -2291,6 +2488,21 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 </div><details id="restoreLogPanel" hidden open><summary>Podgląd przywracania (log YunoHost)</summary><pre id="restoreLogText" role="log" aria-label="Log przywracania"></pre></details>
 <div class="actions"><button type="button" id="cancelRestoreTransfer" class="danger" hidden>Przerwij pobieranie kopii</button></div>
 <div id="restoreMessage" class="message"></div></section>
+<section class="panel" id="leftoverPanel"><h2>Pozostałości po przerwanych kopiach</h2>
+<p class="archive-help">Tutaj możesz usunąć lokalne archiwa pozostawione po anulowaniu oraz niedokończone fragmenty w katalogu wybranego magazynu. Ukończonych kopii ta funkcja nie usuwa.</p>
+<div class="actions"><button type="button" class="secondary" id="refreshLeftovers">Sprawdź pozostałości</button></div>
+<div class="tablewrap"><table class="archive-table"><thead><tr><th>Archiwum</th><th>Lokalnie</th><th>Na SMB</th><th>Akcja</th></tr></thead>
+<tbody id="leftoverRows"><tr><td colspan="4">Kliknij „Sprawdź pozostałości”.</td></tr></tbody></table></div>
+<div id="leftoverMessage" class="message"></div>
+</section>
+<dialog class="restore-dialog" id="leftoverDialog" aria-labelledby="leftoverDialogHeading">
+<h2 id="leftoverDialogHeading">Usuwanie pozostałości</h2>
+<p id="leftoverDialogText"></p>
+<div class="restore-alert bad">Zostaną usunięte wyłącznie zaznaczone pozostałości wskazanego archiwum. Gotowe kopie na SMB pozostaną nietknięte. Operacja jest nieodwracalna.</div>
+<label for="leftoverPhrase">Aby potwierdzić, wpisz <strong>USUŃ</strong></label>
+<input id="leftoverPhrase" type="text" autocomplete="off" spellcheck="false" placeholder="USUŃ">
+<div class="actions"><button type="button" class="secondary" id="leftoverCancel">Anuluj</button><button type="button" id="leftoverConfirm" class="danger" disabled>Usuń pozostałości</button></div>
+</dialog>
 <dialog class="report-dialog" id="reportDialog" aria-labelledby="reportDialogHeading">
 <h2 id="reportDialogHeading">Raport wykonania kopii</h2>
 <div id="reportBody" role="status">Wczytywanie raportu…</div>
@@ -2330,7 +2542,7 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
     </div>
     <div class="category-view" id="view-aktualizacja" data-category="aktualizacja" hidden>
 <section class="panel" id="updatePanel"><h2>Aktualizacje aplikacji</h2>
-<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh19</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
+<p>Wersja zainstalowana: <strong id="versionInstalled">{{ app_version }}</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
 <div id="updateMessage" class="message" style="display:none"></div>
 <div class="actions"><button type="button" id="checkUpdate" class="secondary">Sprawdź aktualizacje</button><button type="button" id="startUpdate" disabled>Aktualizuj aplikację</button></div>
 <div id="updateProgress" hidden>
@@ -2429,7 +2641,7 @@ $('importApps').onclick=async()=>{
 
 // Biblioteka archiwów i przywracanie w tym samym widoku (jak magazyn kopii w Proxmox).
 let archiveRecords=[], selectedArchive='', restoreToken='', deleteToken='', restoreRunning=false, backupWasRunning=false, deletingArchive=false, backupCancelToken='', restoreCancelToken='';
-let activeRestore=null, lastRestoreFinished='';
+let activeRestore=null, lastRestoreFinished='', lastLeftoverCancel='';
 function archiveNotice(ok,text){const box=$('archiveMessage');box.style.display='block';box.className='message '+(ok?'ok':'error');box.textContent=text}
 function readableSize(bytes){if(!Number.isFinite(bytes))return '—';return bytes>=1073741824?(bytes/1073741824).toFixed(2)+' GiB':(bytes/1048576).toFixed(1)+' MiB'}
 function archiveTime(a){if(typeof a.created_at==='number')return new Date(a.created_at*1000).toLocaleString('pl-PL');
@@ -2621,6 +2833,10 @@ function renderBackupChunks(s){
  if(!items.length){panel.hidden=true;return;}
  panel.hidden=false;
  $('backupChunkFolder').textContent=s.archive_folder||'—';
+ const speed=Number.isFinite(s.upload_speed)?s.upload_speed.toFixed(2)+' MiB/s':'pomiar…';
+ const baselines=Object.entries(s.parallel_samples||{}).map(([k,v])=>k+': '+Number(v).toFixed(2)).join(' | ');
+ $('backupThroughput').textContent='Aktywne transfery SMB: '+(s.parallel||1)+' · upload: '+speed+
+   (baselines?' · zmierzone MiB/s (liczba transferów): '+baselines:'');
  const completed=items.filter(c=>c.status==='verified'||c.status==='reused').length;
  $('backupChunkCount').textContent=completed+' / '+items.length+' zweryfikowanych';
  const labels={waiting:'Oczekuje',check:'Sprawdzanie SHA256',upload:'Wysyłanie',verify:'Weryfikacja SHA256',
@@ -2645,6 +2861,7 @@ async function backupPoll(){
  $('cancelBackupTransfer').hidden=!s.can_cancel;const btn=$('runBackup');btn.disabled=!s.available||s.status==='running'||restoreRunning;
  const box=$('backupMessage');box.style.display=s.status==='idle'?'none':'block';box.className='message '+((s.status==='error'||s.status==='cancelled')?'error':'ok');
  box.textContent=s.available?s.message:'Tryb Windows: kopie będą dostępne po uruchomieniu aplikacji na YunoHost.';
+ if(s.status==='cancelled' && lastLeftoverCancel!==s.message){lastLeftoverCancel=s.message;fetchLeftovers().catch(()=>{});}
  const progress=$('backupProgress'),logPanel=$('backupLogPanel'),track=$('backupTrack'),fill=$('backupFill');
  if(s.status==='idle'){progress.hidden=true;logPanel.hidden=true;return}
  const previousBackup=backupWasRunning;
@@ -2680,6 +2897,50 @@ $('cancelBackupTransfer').onclick=async()=>{
  const base=window.location.pathname.replace(/\/$/,'');const r=await fetch(base+'/api/backup/cancel',
  {method:'POST',headers:{'X-Backup-CSRF':backupCancelToken}});
  const x=await r.json();if(!x.success)alert(x.message);await backupPoll();
+};
+let leftoverToken='',leftoverSelected=null,leftoversLoading=false;
+function leftoverNotice(ok,text){const msg=$('leftoverMessage');msg.style.display='block';msg.className='message '+(ok?'ok':'error');msg.textContent=text;}
+async function fetchLeftovers(){
+ if(leftoversLoading)return;
+ const storage=$('backupStorage').value;
+ if(!storage){leftoverNotice(false,'Wybierz magazyn kopii.');return;}
+ leftoversLoading=true;$('refreshLeftovers').disabled=true;
+ try{
+  const base=window.location.pathname.replace(/\/$/,'');
+  const response=await fetch(base+'/api/backup/leftovers?storage='+encodeURIComponent(storage));
+  const data=await response.json();if(!data.success)throw Error(data.message||'Brak listy pozostałości.');
+  leftoverToken=data.csrf||'';const tbody=$('leftoverRows');tbody.replaceChildren();
+  if(!data.records.length){const tr=tbody.insertRow();const td=tr.insertCell();td.colSpan=4;td.textContent='Brak pozostałości dla wskazanego magazynu.';}
+  for(const item of data.records){
+   const row=tbody.insertRow();row.insertCell().textContent=item.name;
+   row.insertCell().textContent=item.local?readableSize(item.size):'Brak';
+   row.insertCell().textContent=item.remote?'Niedokończone części':'Brak';
+   const td=row.insertCell(),button=document.createElement('button');button.type='button';button.className='danger';
+   button.textContent='Usuń pozostałości';button.onclick=()=>{
+    leftoverSelected=item;$('leftoverDialogText').textContent='Kopia: '+item.name+' · lokalnie: '+
+      (item.local?'tak':'nie')+' · niekompletny katalog SMB: '+(item.remote?'tak':'nie');
+    $('leftoverPhrase').value='';$('leftoverConfirm').disabled=true;$('leftoverDialog').showModal();
+   };td.append(button);
+  }
+  leftoverNotice(true,data.remote_error?'Lista lokalna dostępna, ale SMB nie odpowiada: '+data.remote_error:
+      'Wykryto '+data.records.length+' pozostałości.');
+ }catch(e){leftoverNotice(false,e.message)}
+ finally{leftoversLoading=false;$('refreshLeftovers').disabled=false;}
+}
+$('refreshLeftovers').onclick=fetchLeftovers;
+$('leftoverCancel').onclick=()=>$('leftoverDialog').close();
+$('leftoverPhrase').addEventListener('input',()=>{$('leftoverConfirm').disabled=$('leftoverPhrase').value.trim()!=='USUŃ';});
+$('leftoverConfirm').onclick=async()=>{
+ if(!leftoverSelected||$('leftoverPhrase').value.trim()!=='USUŃ')return;
+ const item=leftoverSelected;$('leftoverConfirm').disabled=true;
+ try{
+  const base=window.location.pathname.replace(/\/$/,'');
+  const result=await fetch(base+'/api/backup/leftovers/delete',{
+   method:'POST',headers:{'Content-Type':'application/json','X-Leftover-CSRF':leftoverToken},
+   body:JSON.stringify({name:item.name,storage:item.storage,local:item.local,remote:item.remote,confirmation:'USUŃ'})});
+  const reply=await result.json();if(!reply.success)throw Error(reply.message||'Nie udało się usunąć.');
+  $('leftoverDialog').close();leftoverNotice(true,reply.message);await fetchLeftovers();
+ }catch(e){$('leftoverDialog').close();leftoverNotice(false,e.message)}
 };
 $('cancelRestoreTransfer').onclick=async()=>{
  if(!confirm('Przerwać pobieranie kopii?'))return;

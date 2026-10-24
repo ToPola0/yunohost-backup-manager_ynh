@@ -1,3 +1,18 @@
+# YunoHost Backup Manager **0.5~ynh24**
+
+## Nowe w 0.5~ynh24
+
+- **Automatyczna liczba równoległych transferów SMB2/3: od 1 do 3.** Aplikacja mierzy faktyczny upload części archiwum i porównuje przepustowość przy jednym, dwóch oraz trzech równoległych strumieniach. Zwiększa równoległość tylko wtedy, gdy pomiar wskazuje poprawę (próg 12%); w kolejnych partiach ponownie ocenia wyniki. Jeśli archiwum jest małe, używa tylu strumieni, ile jest części.
+- **SMB1:** jeden transfer, bez równoległych sesji (ograniczenie biblioteki PySMB).
+- **Panel postępu:** aktualna liczba transferów, uzyskana szybkość uploadu w MiB/s, wyniki pomiarów i paski poszczególnych części.
+- **Usuwanie pozostałości anulowanych kopii:** w zakładce „Kopie zapasowe” jest osobna tabela nieukończonych katalogów SMB i pozostawionych lokalnie plików `.tar` / `.info.json`. Po wpisaniu `USUŃ` można usunąć wyłącznie wskazane pozostałości. Kopie zakończone (`complete.json`) i nieznane pliki są chronione przed usunięciem.
+- **Obsługa anulowania:** informacje o anulowanym transferze są zapisywane w katalogu danych wtyczki, więc można wrócić do sprzątania po restarcie. Wtyczka wykrywa również lokalne archiwa pozostawione przez wcześniejsze wersje.
+- **Bez zmian w konfiguracji YunoHost, sieci, Tailscale, OMV czy Proxmox.** Całość działa tylko w aplikacji.
+
+**Bezpieczeństwo:** usuwanie pozostałości jest osobne od kasowania ukończonych kopii i wymaga potwierdzenia. Niedokończony transfer nie trafia na listę kopii do przywracania. Podczas trwającej kopii usuwanie pozostałości jest zablokowane.
+
+---
+
 # YunoHost Backup Manager **0.5~ynh23**
 
 ## Zmiany w 0.5~ynh23 — równoległe przesyłanie części
@@ -118,7 +133,7 @@ Archiwum/yunohost/ybm_Balchan_20261024_113000_abcdef/
 
 ## Historia: 0.5~ynh16 — poprzednia wersja
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh20**
+**Wersja opisana w tej części historii: 0.5~ynh20**
 
 ## Zmiany w 0.5~ynh16 — ponowna instalacja i Harmonogram (cron)
 

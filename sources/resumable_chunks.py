@@ -16,6 +16,7 @@ import pathlib
 import re
 import stat
 import threading
+import time
 
 import smbclient
 
@@ -369,7 +370,7 @@ def local_chunk_hash(path, offset, length):
     return sha.hexdigest()
 
 
-def upload_one(store, local_path, name, chunk, offset, sha, progress=None, cancelled=None):
+def upload_one(store, local_path, name, chunk, offset, sha, progress=None, cancelled=None, on_upload_done=None):
     rel = join_rel(name, chunk['name'])
     if chunks_match(store, rel, chunk['bytes'], sha,
                     progress=(lambda n: progress('check', n)) if progress else None,
@@ -382,6 +383,10 @@ def upload_one(store, local_path, name, chunk, offset, sha, progress=None, cance
         store.stream_write(rel, src, chunk['bytes'])
         if src.pos != chunk['bytes'] or src.sha256.hexdigest() != sha:
             raise IOError('Źródłowy fragment zmienił się podczas wysyłki.')
+    # The SMB file is now closed/flushed. Measure elapsed *upload* time,
+    # excluding any subsequent read-back SHA256 check.
+    if on_upload_done:
+        on_upload_done()
     if not chunks_match(store, rel, chunk['bytes'], sha,
                         progress=(lambda n: progress('verify', n)) if progress else None,
                         cancelled=cancelled):
@@ -465,8 +470,58 @@ def download_file(store, name, role, info, destination, progress=None, cancelled
         raise IOError('Pełne archiwum po złożeniu ma błędne SHA256.')
 
 
+
+class AdaptiveUploadWidth:
+    """Learn *measured* upload goodput at 1/2/3 simultaneous SMB streams.
+
+    Only completed transfers count as measurements. A 12% hysteresis favours
+    fewer connections when higher concurrency fails to improve throughput.
+    Under sustained load the best known width is periodically re-tested.
+    """
+    def __init__(self, maximum=3):
+        self.maximum = max(1, min(3, int(maximum)))
+        self.speeds = {}  # moving-average bytes uploaded / elapsed wall second
+        self.samples = {}
+        self.completed = 0
+        self.next_probe = self.maximum + 4
+        self.current = 1
+
+    def best(self):
+        # Higher concurrency is justified only by a meaningful throughput gain.
+        best_width = 1
+        baseline = self.speeds.get(1, 0.0)
+        for width in range(2, self.maximum + 1):
+            rate = self.speeds.get(width, 0.0)
+            if rate > baseline * 1.12 and rate > 0:
+                best_width, baseline = width, rate
+        return best_width
+
+    def choose(self, remaining):
+        remaining = max(1, int(remaining))
+        # Start one stream, then probe two and three using *real* archive data.
+        for width in range(1, min(self.maximum, remaining) + 1):
+            if width not in self.samples:
+                self.current = width
+                return width
+        target = self.best()
+        if self.completed >= self.next_probe:
+            self.next_probe = self.completed + 5
+            target = min(self.maximum, target + 1) if target < self.maximum else max(1, target - 1)
+        self.current = min(remaining, target)
+        return self.current
+
+    def record(self, width, uploaded_bytes, elapsed):
+        self.completed += 1
+        if uploaded_bytes <= 0 or elapsed <= 0:
+            return None  # Already-correct chunks contain no upload measurement.
+        rate = uploaded_bytes / max(0.001, elapsed)
+        previous = self.speeds.get(width)
+        self.speeds[width] = rate if previous is None else 0.65 * previous + 0.35 * rate
+        self.samples[width] = self.samples.get(width, 0) + 1
+        return rate
+
 def synchronize_chunks(store, name, local_files, manifest, on_verified=None, cancelled=None,
-                       on_progress=None, workers=1, store_factory=None):
+                       on_progress=None, workers=1, store_factory=None, adaptive=False, on_adapt=None):
     """Recheck *every* chunk; transfer only absent/invalid chunks.
 
     No completeness marker is written by this function. Caller publishes it
@@ -492,7 +547,7 @@ def synchronize_chunks(store, name, local_files, manifest, on_verified=None, can
             chunk['sha256'] = digest
             jobs.append((role, n, len(descriptor['chunks']), local, chunk, offset, digest))
 
-    def process_one(worker_store, job, stop=None):
+    def process_one(worker_store, job, stop=None, speed_hook=None):
         role, n, count, local, chunk, offset, digest = job
         def interrupted():
             return (stop is not None and stop.is_set()) or (cancelled and cancelled())
@@ -501,10 +556,13 @@ def synchronize_chunks(store, name, local_files, manifest, on_verified=None, can
         def progress(stage, amount):
             if interrupted():
                 raise InterruptedError('Operator zatrzymał przesyłanie kopii.')
+            if speed_hook:
+                speed_hook(stage, amount)
             if on_progress:
                 on_progress(role, n, stage, amount)
         return upload_one(worker_store, local, name, chunk, offset, digest,
-                          progress=progress, cancelled=interrupted)
+                          progress=progress, cancelled=interrupted,
+                          on_upload_done=(lambda: speed_hook('upload_end', 0)) if speed_hook else None)
 
     def finished(job, outcome):
         role, n, count, _local, chunk, _offset, _digest = job
@@ -518,6 +576,68 @@ def synchronize_chunks(store, name, local_files, manifest, on_verified=None, can
     if workers <= 1 or not store_factory or len(jobs) <= 1:
         for job in jobs:
             finished(job, process_one(store, job))
+    elif adaptive:
+        # Batch adaptation avoids simultaneous access to one SMB session.
+        # Measurements are upload bytes / real elapsed time, *not* read-back
+        # verification bytes. No artificial speed tests or extra SMB files.
+        maximum = min(int(workers), 3, len(jobs))
+        tuning = AdaptiveUploadWidth(maximum)
+        offset = 0
+        stop = threading.Event()
+
+        with ThreadPoolExecutor(max_workers=maximum, thread_name_prefix='ybm-part') as pool:
+            while offset < len(jobs):
+                if cancelled and cancelled():
+                    raise InterruptedError('Operator zatrzymał przesyłanie kopii.')
+                remaining = len(jobs) - offset
+                width = tuning.choose(remaining)
+                batch = jobs[offset:offset + width]
+                if on_adapt:
+                    on_adapt(width, None, dict(tuning.speeds))
+                sample = {'first': None, 'last': None, 'bytes': 0}
+                sample_lock = threading.Lock()
+
+                def speed_hook(stage, amount):
+                    if stage not in ('upload', 'upload_end'):
+                        return
+                    now = time.monotonic()
+                    with sample_lock:
+                        if stage == 'upload':
+                            if sample['first'] is None:
+                                sample['first'] = now
+                            sample['bytes'] += max(0, amount)
+                        if sample['first'] is not None:
+                            sample['last'] = now
+
+                def run_worker(job):
+                    if stop.is_set():
+                        raise InterruptedError('Przerwano równoległe przesyłanie.')
+                    with store_factory() as worker_store:
+                        return process_one(worker_store, job, stop, speed_hook)
+
+                futures = [pool.submit(run_worker, job) for job in batch]
+                finished_jobs = []
+                first_error = None
+                for future, job in zip(futures, batch):
+                    try:
+                        finished_jobs.append((job, future.result()))
+                    except Exception as exc:
+                        stop.set()
+                        if first_error is None or (isinstance(first_error, InterruptedError)
+                                                   and not isinstance(exc, InterruptedError)):
+                            first_error = exc
+                if first_error:
+                    raise first_error
+                # Only measure the interval of *actual upload*, excluding
+                # SHA256 read-back, local hashing and SMB session startup.
+                elapsed = (sample['last'] - sample['first']) if sample['first'] is not None else 0
+                uploaded = sample['bytes']
+                speed = tuning.record(width, uploaded, elapsed)
+                for job, outcome in finished_jobs:
+                    finished(job, outcome)
+                if on_adapt:
+                    on_adapt(width, speed, dict(tuning.speeds))
+                offset += len(batch)
     else:
         workers = min(int(workers), 3, len(jobs))
         stop = threading.Event()

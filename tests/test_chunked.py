@@ -258,7 +258,9 @@ class ChunkTests(unittest.TestCase):
         answer = c.synchronize_chunks(self.store, self.name, self.files, self.manifest,
                                       workers=3, store_factory=new_session)
         self.assertEqual(answer['sent'] + answer['reused'], 6)
-        self.assertGreater(answer['reused'], 0)
+        # Parallel cancellation may stop every worker before any part finishes.
+        if previously_complete:
+            self.assertGreater(answer['reused'], 0)
         for part in previously_complete:
             self.assertEqual(self.store.upload_count[part], previously_complete[part])
         self.commit()
