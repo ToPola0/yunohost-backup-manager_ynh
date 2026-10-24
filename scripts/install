@@ -1,14 +1,11 @@
 #!/bin/bash
 source /usr/share/yunohost/helpers
-# Preserve an existing manually installed version and its encrypted SMB credentials.
-mkdir -p "$install_dir/data"
-if [ -f "$install_dir/app.py" ]; then
-    cp -a "$install_dir/app.py" "$install_dir/app.py.before-ynh"
-fi
+# Data is managed separately to avoid deleting credentials during upgrades.
 cp ../sources/app.py "$install_dir/app.py"
+ln -s "$data_dir" "$install_dir/data"
+chmod 700 "$data_dir"
 python3 -m venv "$install_dir/venv"
 "$install_dir/venv/bin/pip" install --disable-pip-version-check 'Flask==3.1.3' 'cryptography' 'smbprotocol==1.17.0' 'pysmb' 'gunicorn'
-chmod 700 "$install_dir/data"
 ynh_add_nginx_config
 ynh_add_systemd_config
 systemctl daemon-reload

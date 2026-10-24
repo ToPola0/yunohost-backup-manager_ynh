@@ -3,4 +3,3 @@ source /usr/share/yunohost/helpers
 systemctl disable --now "$app" 2>/dev/null || true
 ynh_remove_systemd_config
 ynh_remove_nginx_config
-# Data in install_dir is managed by YunoHost's install_dir resource.

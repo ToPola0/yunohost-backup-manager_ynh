@@ -1,14 +1,13 @@
-# YunoHost Backup Manager – pakiet YunoHost
+# YunoHost Backup Manager — 0.5~ynh3 (wersja testowa)
 
-Pakiet eksperymentalny (nieprzetestowany na działającym YunoHost).
+Pakiet przeznaczony do instalacji przez YunoHost 12.1 z repozytorium Git.
 
-W panelu YunoHost: Aplikacje → Zainstaluj → Niestandardowy adres URL.
-Panel YunoHost nie zawsze obsługuje lokalne archiwa ZIP jako źródło.
-W takim przypadku pakiet wymaga umieszczenia w repozytorium Git.
+Ważne: aplikacja wykonuje komendy YunoHost jako root. Nie wystawiaj jej publicznie.
+Dostęp do panelu ogranicz do administratorów YunoHost.
 
-Instalacja wymaga oddzielnej domeny (ścieżka /), nie instaluj na domenie
-z działającymi już stronami. Usługa działa jako root, ponieważ wywołuje
-polecenia tworzenia kopii YunoHost. Nie udostępniaj jej publicznie bez
-weryfikacji autoryzacji i zabezpieczeń. Zachowuje istniejące pliki data/
-w /opt/yunohost-backup-manager podczas instalacji, ale usunięcie aplikacji
-przez YunoHost może usunąć katalog instalacyjny i zapisane hasła.
+Panel wymaga osobnej domeny lub wolnej domeny z URL /.
+Backend nasłuchuje na 127.0.0.1:5051, aby nie kolidować z ręczną wersją na 5050.
+Nowa instalacja tworzy nową bazę magazynów SMB; nie importuje danych z ręcznej instalacji.
+Dane trzymane są w katalogu data_dir zarządzanym przez YunoHost.
+
+Skrypty sprawdzono składniowo, nie przetestowano instalacji na żywym YunoHost.

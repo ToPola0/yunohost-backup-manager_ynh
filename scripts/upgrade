@@ -1,8 +1,14 @@
 #!/bin/bash
 source /usr/share/yunohost/helpers
 cp ../sources/app.py "$install_dir/app.py"
+if [ ! -L "$install_dir/data" ]; then
+    echo "Expected managed data directory symlink missing; refusing unsafe upgrade" >&2
+    exit 1
+fi
+python3 -m venv "$install_dir/venv"
 "$install_dir/venv/bin/pip" install --disable-pip-version-check 'Flask==3.1.3' 'cryptography' 'smbprotocol==1.17.0' 'pysmb' 'gunicorn'
 ynh_add_nginx_config
 ynh_add_systemd_config
 systemctl daemon-reload
+systemctl enable "$app"
 systemctl restart "$app"

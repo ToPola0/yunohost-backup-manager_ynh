@@ -3,7 +3,7 @@ id = "yunohost-backup-manager"
 name = "YunoHost Backup Manager"
 description.en = "Back up YunoHost applications to SMB shares"
 description.pl = "Kopie zapasowe aplikacji YunoHost na udziały SMB"
-version = "0.5~ynh2"
+version = "0.5~ynh3"
 maintainers = ["ToPola0"]
 
 [upstream]
@@ -32,6 +32,8 @@ ram.runtime = "100M"
     [resources.system_user]
     [resources.install_dir]
     dir = "/opt/yunohost-backup-manager-ynh"
+    [resources.data_dir]
+    subdir = "__APP__"
     [resources.permissions]
         [resources.permissions.main]
         url = "/"
