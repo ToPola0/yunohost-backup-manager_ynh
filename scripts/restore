@@ -3,6 +3,7 @@ set -e
 source /usr/share/yunohost/helpers
 ynh_restore "$data_dir"
 cp ../sources/app.py "$install_dir/app.py"
+cp ../sources/cron_schedule.py "$install_dir/cron_schedule.py"
 cp ../sources/smb_transport.py "$install_dir/smb_transport.py"
 cp ../sources/updater.py "$install_dir/updater.py"
 cp ../sources/update_runner.py "$install_dir/update_runner.py"

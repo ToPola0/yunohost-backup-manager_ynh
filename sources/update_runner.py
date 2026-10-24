@@ -61,12 +61,14 @@ def log_line(message):
         log.write('YBM CHECK ' + message + '\n')
 
 
-def run(expected_version):
+def run(expected_version, force=False):
     started = int(time.time())
     write_state(status='running', target=expected_version,
                 started_at=started,
                 message='YunoHost aktualizuje aplikację. Panel może być chwilowo niedostępny.')
     command = ['/usr/bin/yunohost', 'app', 'upgrade', APP_ID, '--url', REPOSITORY]
+    if force:
+        command.append('--force')
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         fd = os.open(LOG_FILE, flags, 0o600)
@@ -94,10 +96,10 @@ def run(expected_version):
             ok, detail = await_runtime(expected_version, attempts=22)
             if not ok:
                 raise RuntimeError('Nowa wersja jest na dysku, lecz panel jej nie uruchomił: ' + str(detail))
-        log_line('Weryfikacja zakończona: panel działa w wersji ' + expected_version)
+        log_line(('Ponowna instalacja' if force else 'Aktualizacja') + ' zakończona: panel działa w wersji ' + expected_version)
         write_state(status='success', target=expected_version,
                     started_at=started, finished_at=int(time.time()),
-                    message='Aktualizacja zweryfikowana: panel działa w wersji ' + expected_version + '.')
+                    message=('Ponowna instalacja zakończona: ' if force else 'Aktualizacja zweryfikowana: ') + 'panel działa w wersji ' + expected_version + '.')
     except Exception as exc:
         error = '%s: %s' % (type(exc).__name__, exc)
         try:
@@ -112,5 +114,6 @@ def run(expected_version):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--expected-version', required=True)
+    parser.add_argument('--force', action='store_true')
     args = parser.parse_args()
-    run(args.expected_version)
+    run(args.expected_version, force=args.force)

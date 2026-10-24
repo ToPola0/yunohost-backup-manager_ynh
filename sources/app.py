@@ -20,7 +20,11 @@ import hmac
 import secrets
 import unicodedata
 import tempfile
+import json
+import datetime
+import fcntl
 from updater import APP_VERSION, check_remote, read_state, write_state, read_log_chunk, LOG_FILE
+from cron_schedule import CronSpec, next_occurrence
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
@@ -62,6 +66,11 @@ with db_connect() as db:
     columns = {row[1] for row in db.execute('PRAGMA table_info(magazyny)')}
     if 'subdirectory' not in columns:
         db.execute("ALTER TABLE magazyny ADD COLUMN subdirectory TEXT NOT NULL DEFAULT ''")
+    db.execute('''CREATE TABLE IF NOT EXISTS harmonogramy (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, cron TEXT NOT NULL,
+        storage_id TEXT NOT NULL, apps_json TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+        last_slot TEXT, last_run TEXT, last_result TEXT DEFAULT 'Nie uruchomiono'
+    )''')
 
 
 def clean(data, require_share=True, require_id=False):
@@ -602,6 +611,181 @@ def backup_start():
     return jsonify(success=True, message='Rozpoczęto wykonywanie kopii.')
 
 
+# Harmonogram CRON w obrębie wtyczki. Nie modyfikuje systemowego crontaba.
+def schedule_csrf_valid():
+    supplied = request.headers.get('X-Schedule-CSRF', '')
+    expected = session.get('schedule_csrf', '')
+    return bool(supplied and expected and hmac.compare_digest(supplied, expected))
+
+
+def schedules_public():
+    with db_connect() as db:
+        rows = db.execute('SELECT * FROM harmonogramy ORDER BY name COLLATE NOCASE').fetchall()
+    result = []
+    for row in rows:
+        schedule = dict(row)
+        schedule['enabled'] = bool(schedule['enabled'])
+        schedule['apps'] = json.loads(schedule.pop('apps_json'))
+        try:
+            schedule['next_run'] = next_occurrence(schedule['cron']).strftime('%d.%m.%Y %H:%M') if schedule['enabled'] else None
+        except (ValueError, OverflowError):
+            schedule['next_run'] = 'Nie można wyznaczyć'
+        result.append(schedule)
+    return result
+
+
+@app.get('/api/schedules')
+def list_schedules():
+    token = secrets.token_urlsafe(32)
+    session['schedule_csrf'] = token
+    return jsonify(success=True, csrf=token, schedules=schedules_public())
+
+
+def validate_schedule(data):
+    name = str(data.get('name', '')).strip()
+    expression = str(data.get('cron', '')).strip()
+    storage = data.get('storage', '')
+    apps = data.get('apps', [])
+    enabled = data.get('enabled', True)
+    if not 1 <= len(name) <= 100:
+        raise ValueError('Nazwa harmonogramu musi mieć od 1 do 100 znaków.')
+    CronSpec(expression)  # parse once before persisting; rejects malformed ranges and steps
+    if not isinstance(storage, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,49}', storage):
+        raise ValueError('Nieprawidłowy identyfikator magazynu.')
+    with db_connect() as db:
+        if not db.execute('SELECT 1 FROM magazyny WHERE id=?', (storage,)).fetchone():
+            raise ValueError('Wybierz istniejący magazyn.')
+    if not isinstance(apps, list) or not apps or len(apps) > 100 or len(set(map(str, apps))) != len(apps):
+        raise ValueError('Wybierz co najmniej jedną aplikację, bez powtórzeń.')
+    known = {app['id'] for app in actual_apps()}
+    if any(not isinstance(item, str) or item not in known for item in apps):
+        raise ValueError('Wybrane aplikacje nie są aktualnie zainstalowane w YunoHost.')
+    if not isinstance(enabled, bool):
+        raise ValueError('Nieprawidłowy stan harmonogramu.')
+    return name, expression, storage, json.dumps(apps), int(enabled)
+
+
+@app.post('/api/schedules')
+def add_schedule():
+    if not schedule_csrf_valid():
+        return jsonify(success=False, message='Odśwież zakładkę Harmonogram — wygasło potwierdzenie.'), 403
+    if not on_yunohost():
+        return jsonify(success=False, message='Harmonogram jest dostępny tylko na YunoHost.'), 400
+    try:
+        name, expr, storage, apps, enabled = validate_schedule(request.get_json(silent=True) or {})
+        with db_connect() as db:
+            db.execute('INSERT INTO harmonogramy (id,name,cron,storage_id,apps_json,enabled) VALUES (?,?,?,?,?,?)',
+                       (uuid.uuid4().hex, name, expr, storage, apps, enabled))
+        return jsonify(success=True, message='Harmonogram został zapisany.')
+    except (ValueError, TypeError) as exc:
+        return jsonify(success=False, message=str(exc)), 400
+
+
+@app.put('/api/schedules/<schedule_id>')
+def modify_schedule(schedule_id):
+    if not schedule_csrf_valid():
+        return jsonify(success=False, message='Odśwież zakładkę Harmonogram — wygasło potwierdzenie.'), 403
+    try:
+        name, expr, storage, apps, enabled = validate_schedule(request.get_json(silent=True) or {})
+        with db_connect() as db:
+            result = db.execute('UPDATE harmonogramy SET name=?,cron=?,storage_id=?,apps_json=?,enabled=?,last_slot=NULL WHERE id=?',
+                                (name,expr,storage,apps,enabled,schedule_id))
+        if not result.rowcount:
+            return jsonify(success=False, message='Nie znaleziono harmonogramu.'), 404
+        return jsonify(success=True, message='Harmonogram zaktualizowany.')
+    except (ValueError, TypeError) as exc:
+        return jsonify(success=False, message=str(exc)), 400
+
+
+@app.delete('/api/schedules/<schedule_id>')
+def remove_schedule(schedule_id):
+    if not schedule_csrf_valid():
+        return jsonify(success=False, message='Odśwież zakładkę Harmonogram — wygasło potwierdzenie.'), 403
+    with db_connect() as db:
+        result = db.execute('DELETE FROM harmonogramy WHERE id=?', (schedule_id,))
+    if not result.rowcount:
+        return jsonify(success=False, message='Nie znaleziono harmonogramu.'), 404
+    return jsonify(success=True, message='Harmonogram usunięty. Archiwa kopii pozostały bez zmian.')
+
+
+def schedule_result(schedule_id, outcome):
+    try:
+        with db_connect() as db:
+            db.execute('UPDATE harmonogramy SET last_result=? WHERE id=?', (outcome[:400], schedule_id))
+    except sqlite3.Error:
+        app.logger.exception('Nie zapisano wyniku harmonogramu')
+
+
+def scheduled_backup_runner(app_ids, storage, names, schedule_id):
+    try:
+        backup_worker(app_ids, storage, names)
+        with BACKUP_STATE_GUARD:
+            result = BACKUP_STATE['status']
+            message = BACKUP_STATE['message']
+        schedule_result(schedule_id, ('Zakończono: ' if result == 'success' else 'Błąd: ') + message[:240])
+    except BaseException as exc:
+        schedule_result(schedule_id, 'Błąd zadania: ' + str(exc)[:240])
+        raise
+
+
+def scheduler_tick(now=None):
+    if not on_yunohost():
+        return
+    now = now or datetime.datetime.now().astimezone()
+    slot = now.strftime('%Y-%m-%d %H:%M %z')
+    with db_connect() as db:
+        schedules = db.execute('SELECT * FROM harmonogramy WHERE enabled=1').fetchall()
+    for item in schedules:
+        try:
+            if not CronSpec(item['cron']).matches(now):
+                continue
+            with db_connect() as db:
+                claimed = db.execute('UPDATE harmonogramy SET last_slot=?,last_run=?,last_result=? '
+                                     'WHERE id=? AND enabled=1 AND (last_slot IS NULL OR last_slot<>?)',
+                                     (slot, now.strftime('%d.%m.%Y %H:%M'), 'Przygotowanie…', item['id'], slot))
+            if not claimed.rowcount:
+                continue
+            if read_state().get('status') in ('launching','running') or not BACKUP_LOCK.acquire(blocking=False):
+                schedule_result(item['id'], 'Pominięto termin: trwa inna kopia, przywracanie lub aktualizacja.')
+                continue
+            try:
+                ids = json.loads(item['apps_json'])
+                names = {a['id']: a['name'] for a in actual_apps()}
+                if not ids or any(a not in names for a in ids):
+                    raise ValueError('Co najmniej jedna aplikacja nie jest już zainstalowana.')
+                cfg_from_storage(item['storage_id'])  # deleted storage / missing credentials
+                backup_event('Harmonogram: ' + item['name'] + '. Rozpoczynanie kopii…', phase='prepare', status='running', reset=True)
+                thread = threading.Thread(target=scheduled_backup_runner,
+                                          args=(ids, item['storage_id'], [names[a] for a in ids], item['id']), daemon=True)
+                thread.start()
+                schedule_result(item['id'], 'Uruchomiono kopię — szczegóły w zakładce Kopie zapasowe.')
+            except Exception:
+                BACKUP_LOCK.release()
+                raise
+        except Exception as exc:
+            schedule_result(item['id'], 'Błąd harmonogramu: ' + str(exc)[:240])
+            app.logger.exception('Błąd zadania cron %s', item['id'])
+
+
+def scheduler_loop():
+    # Prevent duplicate runs even if Gunicorn were configured with more workers.
+    lock_file = DATA / '.cron-scheduler.lock'
+    with lock_file.open('a+b') as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        while True:
+            try:
+                scheduler_tick()
+            except Exception:
+                app.logger.exception('Błąd pętli harmonogramu')
+            time.sleep(12)
+
+
+threading.Thread(target=scheduler_loop, name='ybm-cron', daemon=True).start()
+
+
 # Archiwum -> wybór kopii -> przywracanie: w tym samym panelu co tworzenie.
 # Wykorzystuje wyłącznie istniejące połączenia SMB wtyczki i interfejs CLI YunoHost.
 RESTORE_STATE_GUARD = threading.RLock()
@@ -1101,9 +1285,12 @@ def updates_start():
         if current['status'] in ('launching', 'running'):
             return jsonify(success=False, message='Aktualizacja już trwa.'), 409
         version = check_remote()  # Repeat validation immediately before launching.
-        if not version['available']:
-            return jsonify(success=False, message='Masz już najnowszą wersję.'), 409
-        expected_version = (request.get_json(silent=True) or {}).get('version')
+        payload = request.get_json(silent=True) or {}
+        repair = payload.get('repair') is True
+        same_version = version['latest'] == APP_VERSION
+        if not version['available'] and not (repair and same_version):
+            return jsonify(success=False, message='Brak nowej wersji. Ponowna instalacja jest możliwa po wybraniu trybu naprawy.'), 409
+        expected_version = payload.get('version')
         if not isinstance(expected_version, str) or expected_version != version['latest']:
             return jsonify(success=False, message='Wersja na GitHubie zmieniła się. Sprawdź ponownie.'), 409
         runner = str(ROOT / 'update_runner.py')
@@ -1122,7 +1309,7 @@ def updates_start():
             result = subprocess.run(
                 [systemd_run, '--quiet', '--collect', '--unit=' + unit,
                  '--property=Type=exec', '--', '/usr/bin/python3', runner,
-                 '--expected-version', expected_version],
+                 '--expected-version', expected_version] + (['--force'] if repair else []),
                 capture_output=True, text=True, timeout=20, check=False)
             if result.returncode:
                 raise RuntimeError((result.stderr or result.stdout or 'systemd-run nie uruchomił aktualizacji.')[-1200:])
@@ -1130,7 +1317,7 @@ def updates_start():
             write_state(status='error', target=expected_version,
                         finished_at=int(time.time()), message='Nie uruchomiono aktualizacji: %s' % exc)
             return jsonify(success=False, message=str(exc)), 500
-        return jsonify(success=True, message='Aktualizacja uruchomiona.', target=expected_version)
+        return jsonify(success=True, message='Ponowna instalacja uruchomiona.' if repair else 'Aktualizacja uruchomiona.', target=expected_version)
     except Exception as exc:
         return jsonify(success=False, message='Nie można rozpocząć aktualizacji: %s' % exc), 500
     finally:
@@ -1174,7 +1361,7 @@ textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border
 #importLogPanel pre{font:12px/1.55 Consolas,'Liberation Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:240px;min-height:65px;margin:0;padding:14px;color:#d8e7ff;background:#142136}
 #importLogPanel[hidden],#importProgress[hidden]{display:none}
 
-/* Panel 0.5~ynh15 — nawigacja kategoriami. */
+/* Panel 0.5~ynh16 — nawigacja kategoriami. */
 :root{--navy:#14263e;--navy-soft:#1c3552;--primary:#2d639c;--line:#e2e8f0;--text:#20334b;--muted:#637389}
 html{min-height:100%;scroll-behavior:smooth}
 body{background:#f2f5f9;color:var(--text)}
@@ -1211,7 +1398,7 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
  .sidebar-brand{margin:0 0 13px;padding:0 4px 10px;border-bottom:1px solid #ffffff1b}
  .sidebar-brand img{width:36px;height:36px}.brand-copy strong{font-size:13px;line-height:1.2}.brand-copy small{margin-top:3px}
  .sidebar-group-label,.sidebar-bottom{display:none}
- .sidebar-nav{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+ .sidebar-nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
  .nav-item{justify-content:center;gap:7px;padding:11px 6px;text-align:center;font-size:12px}
  .nav-item svg{width:17px;height:17px}.nav-item.active{box-shadow:inset 0 -3px 0 #67c2fa}
  .workspace-topbar{min-height:48px;padding:10px 18px;font-size:12px}
@@ -1254,23 +1441,35 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 .restore-alert.bad{background:#fbe5e5;color:#842a2a}
 .restore-dialog .actions{justify-content:flex-end}
 
+
+/* Harmonogram kopii: wszystkie ustawienia przechowywane w danych wtyczki. */
+.schedule-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 16px}
+.schedule-hint{font-size:12px;line-height:1.6;color:#5b6f86;margin-top:9px}
+.schedule-apps{max-height:230px;overflow-y:auto;padding:8px 12px;border:1px solid #dce4ee;border-radius:8px}
+.schedule-apps .appitem{margin:0;font-weight:normal}
+.schedule-table td{vertical-align:middle;font-size:13px}
+.schedule-tag{display:inline-block;border-radius:14px;background:#e0f1e7;color:#23744a;padding:5px 9px;font-size:12px}
+.schedule-tag.off{background:#eceff4;color:#57677b}
+.schedule-grid-actions{display:flex;gap:6px;flex-wrap:wrap}
+@media(max-width:720px){.schedule-form-grid{grid-template-columns:1fr}}
 </style></head><body>
 <div class="app-shell">
 <aside class="app-sidebar" aria-label="Menu aplikacji">
   <div class="sidebar-brand">
     <img id="appLogo" alt="" width="48" height="48">
-    <div class="brand-copy"><strong>YunoHost<br>Backup Manager</strong><small>0.5~ynh15</small></div>
+    <div class="brand-copy"><strong>YunoHost<br>Backup Manager</strong><small>0.5~ynh16</small></div>
   </div>
   <div class="sidebar-group-label">ZARZĄDZANIE</div>
   <nav class="sidebar-nav" aria-label="Kategorie">
 <a class="nav-item active" href="#magazyn" data-view="magazyn" aria-current="page"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="18" height="7" rx="2"/><rect x="3" y="13.5" width="18" height="7" rx="2"/><path d="M7.5 7h.01M7.5 17h.01M11 7h7M11 17h7"/></svg><span>Magazyn</span></a>
 <a class="nav-item" href="#kopie" data-view="kopie"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7.5V5a2 2 0 0 1 2-2h8l4 4v12a2 2 0 0 1-2 2h-2"/><path d="M15 3v5h5M3 16a6 6 0 1 0 2-4.5"/><path d="M3 11v5h5"/></svg><span>Kopie zapasowe</span></a>
+<a class="nav-item" href="#harmonogram" data-view="harmonogram"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2M7 2v3M17 2v3"/></svg><span>Harmonogram (cron)</span></a>
 <a class="nav-item" href="#aktualizacja" data-view="aktualizacja"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V3m0 0L7.5 7.5M12 3l4.5 4.5M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg><span>Aktualizacja</span></a>
   </nav>
   <div class="sidebar-bottom"><span class="sidebar-mark"></span> Panel kopii zapasowych</div>
 </aside>
 <div class="app-workspace">
-  <header class="workspace-topbar"><span>YunoHost <span class="crumb-divider">/</span> Backup Manager</span><span class="version-pill">v0.5~ynh15</span></header>
+  <header class="workspace-topbar"><span>YunoHost <span class="crumb-divider">/</span> Backup Manager</span><span class="version-pill">v0.5~ynh16</span></header>
   <main class="workspace-content" id="mainContent">
     <div class="page-heading"><span class="page-eyebrow">PANEL ZARZĄDZANIA</span><h1 id="viewTitle">Magazyn</h1><p id="viewDescription">Zarządzaj magazynami SMB/CIFS i połączeniami sieciowymi.</p></div>
     <div class="category-view" id="view-magazyn" data-category="magazyn">
@@ -1329,9 +1528,26 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 <input id="restorePhrase" type="text" autocomplete="off" placeholder="PRZYWRÓĆ" />
 <div class="actions"><button type="button" class="secondary" id="cancelRestore">Anuluj</button><button type="button" id="confirmRestore" class="danger" disabled>Rozpocznij przywracanie</button></div></dialog>
     </div>
+    <div class="category-view" id="view-harmonogram" data-category="harmonogram" hidden>
+      <section class="panel"><h2>Harmonogram kopii zapasowych</h2>
+        <p class="schedule-hint">Zadania wykonują się automatycznie według pięciopolowego zapisu cron w lokalnej strefie czasowej serwera. Używają tych samych magazynów, kontroli SHA256 i logu co kopia ręczna. Jeśli trwa inna operacja, dany termin zostanie pominięty. Wtyczka nie modyfikuje systemowego crontaba.</p>
+        <div class="tablewrap"><table class="schedule-table"><thead><tr><th>Nazwa</th><th>Magazyn</th><th>Cron</th><th>Następne uruchomienie</th><th>Stan</th><th>Ostatni wynik</th><th>Akcje</th></tr></thead><tbody id="scheduleRows"><tr><td colspan="7">Ładowanie harmonogramów…</td></tr></tbody></table></div>
+      </section>
+      <section class="panel"><h2 id="scheduleFormTitle">Dodaj harmonogram</h2>
+        <form id="scheduleForm"><div class="schedule-form-grid">
+          <div><label for="scheduleName">Nazwa zadania</label><input id="scheduleName" maxlength="100" placeholder="np. Kopia nocna" required></div>
+          <div><label for="scheduleStorage">Magazyn docelowy</label><select id="scheduleStorage" required><option value="">Wybierz magazyn</option></select></div>
+          <div><label for="schedulePreset">Częstotliwość</label><select id="schedulePreset"><option value="0 2 * * *">Codziennie o 02:00</option><option value="0 2 * * 0">Co niedzielę o 02:00</option><option value="0 2 * * 1">Co poniedziałek o 02:00</option><option value="0 2 1 * *">Pierwszego dnia miesiąca o 02:00</option><option value="custom">Własny zapis cron</option></select></div>
+          <div><label for="scheduleCron">Wyrażenie cron (min godz dzień miesiąc dzień tyg.)</label><input id="scheduleCron" value="0 2 * * *" maxlength="120" spellcheck="false" required><p class="schedule-hint">Przykład: <code>30 3 * * 1-5</code> — od poniedziałku do piątku o 03:30.</p></div>
+        </div><label>Aplikacje objęte kopią</label><div class="schedule-apps" id="scheduleApps">Ładowanie aplikacji…</div>
+        <label class="appitem"><input type="checkbox" id="scheduleEnabled" checked><span>Harmonogram włączony</span></label>
+        <div class="actions"><button type="submit" id="scheduleSave">Zapisz harmonogram</button><button type="button" class="secondary" id="scheduleCancel" hidden>Anuluj edycję</button><button type="button" class="secondary" id="scheduleRefresh">Odśwież</button></div></form>
+        <div id="scheduleMessage" class="message"></div>
+      </section>
+    </div>
     <div class="category-view" id="view-aktualizacja" data-category="aktualizacja" hidden>
 <section class="panel" id="updatePanel"><h2>Aktualizacje aplikacji</h2>
-<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh15</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
+<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh16</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
 <div id="updateMessage" class="message" style="display:none"></div>
 <div class="actions"><button type="button" id="checkUpdate" class="secondary">Sprawdź aktualizacje</button><button type="button" id="startUpdate" disabled>Aktualizuj aplikację</button></div>
 <div id="updateProgress" hidden>
@@ -1351,6 +1567,7 @@ const $=id=>document.getElementById(id);let editing=null;let records=[];
 const categoryDetails={
  magazyn:{title:'Magazyn',description:'Zarządzaj magazynami SMB/CIFS i połączeniami sieciowymi.'},
  kopie:{title:'Kopie zapasowe',description:'Przeglądaj archiwa z magazynu, twórz nowe kopie i przywracaj wybrane aplikacje.'},
+ harmonogram:{title:'Harmonogram (cron)',description:'Automatyczne kopie zapasowe według ustalonego terminarza.'},
  aktualizacja:{title:'Aktualizacja',description:'Sprawdź nową wersję aplikacji i zobacz przebieg aktualizacji.'}
 };
 function navigateCategory(name){
@@ -1380,7 +1597,7 @@ async function api(url,method='GET',payload){const base=window.location.pathname
 function busy(v){for(const x of ['discover','test','save'])$(x).disabled=v}
 function storageLocation(m){return m.share+(m.subdirectory?'/'+m.subdirectory.replace(/^\/+|\/+$/g,''):'')}
 function reset(){editing=null;$('form').reset();$('id').disabled=false;$('password').required=true;$('formTitle').textContent='Dodaj magazyn SMB/CIFS';$('cancel').hidden=true;$('share').innerHTML='<option value="">Najpierw pobierz udziały</option>'}
-async function refresh(){const x=await api('/api/magazyny');records=x.magazyny||[];const storage=$('backupStorage');const selected=storage.value;storage.replaceChildren(new Option('Wybierz magazyn',''));for(const m of records)storage.add(new Option(m.id+' ('+m.server+'/'+storageLocation(m)+')',m.id));storage.value=selected|| (records.length===1?records[0].id:'');if(storage.value!==selected)refreshArchives().catch(e=>archiveNotice(false,e.message));const tbody=$('rows');tbody.replaceChildren();if(!records.length){const tr=tbody.insertRow();const td=tr.insertCell();td.colSpan=5;td.textContent='Brak zapisanych magazynów.';return}for(const m of records){const tr=tbody.insertRow();for(const v of [m.id,m.server,storageLocation(m),m.protocol==='auto'?'Auto':m.protocol.toUpperCase()])tr.insertCell().textContent=v;const td=tr.insertCell();for(const [title,fn,danger] of [['Edytuj',()=>edit(m.id),false],['Usuń',()=>remove(m.id),true]]){const b=document.createElement('button');b.textContent=title;b.className=danger?'danger':'secondary';b.onclick=fn;td.appendChild(b)}}}
+async function refresh(){const x=await api('/api/magazyny');records=x.magazyny||[];syncScheduleStorages();const storage=$('backupStorage');const selected=storage.value;storage.replaceChildren(new Option('Wybierz magazyn',''));for(const m of records)storage.add(new Option(m.id+' ('+m.server+'/'+storageLocation(m)+')',m.id));storage.value=selected|| (records.length===1?records[0].id:'');if(storage.value!==selected)refreshArchives().catch(e=>archiveNotice(false,e.message));const tbody=$('rows');tbody.replaceChildren();if(!records.length){const tr=tbody.insertRow();const td=tr.insertCell();td.colSpan=5;td.textContent='Brak zapisanych magazynów.';return}for(const m of records){const tr=tbody.insertRow();for(const v of [m.id,m.server,storageLocation(m),m.protocol==='auto'?'Auto':m.protocol.toUpperCase()])tr.insertCell().textContent=v;const td=tr.insertCell();for(const [title,fn,danger] of [['Edytuj',()=>edit(m.id),false],['Usuń',()=>remove(m.id),true]]){const b=document.createElement('button');b.textContent=title;b.className=danger?'danger':'secondary';b.onclick=fn;td.appendChild(b)}}}
 function edit(id){const m=records.find(x=>x.id===id);if(!m)return;editing=id;for(const k of ['id','server','username','domain','protocol','subdirectory'])$(k).value=m[k]||'';$('id').disabled=true;$('password').value='';$('password').required=false;$('share').replaceChildren(new Option(m.share,m.share));$('formTitle').textContent='Edytuj magazyn: '+id;$('cancel').hidden=false;msg(true,'Edytujesz magazyn. Puste hasło zachowa poprzednie.');$('form').scrollIntoView({behavior:'smooth'})}
 async function remove(id){if(!confirm('Usunąć magazyn '+id+'?'))return;const x=await api('/api/magazyny/'+encodeURIComponent(id),'DELETE');msg(x.success,x.message);if(x.success){if(editing===id)reset();await refresh()}}
 $('cancel').onclick=()=>{reset();msg(true,'Anulowano edycję.')};
@@ -1581,7 +1798,45 @@ $('runBackup').onclick=async()=>{
  const r=await api('/api/backup/start','POST',{apps,storage});
  if(!r.success)alert(r.message);else{document.getElementById('backupCreatePanel').hidden=false;backupWasRunning=true}await backupPoll();
 };
-let updateToken='';let availableUpdate='';let updating=false;
+// Zakładka harmonogramu — cron zapisany tylko w bazie danych wtyczki.
+let scheduleToken='',scheduleEditing='',scheduleRows=[];
+function scheduleNotice(ok,text){const el=$('scheduleMessage');el.style.display='block';el.className='message '+(ok?'ok':'error');el.textContent=text;}
+function syncScheduleStorages(){const node=$('scheduleStorage'),old=node.value;node.replaceChildren(new Option('Wybierz magazyn',''));
+ for(const m of records)node.add(new Option(m.id+' ('+storageLocation(m)+')',m.id));node.value=old;}
+function scheduleAppChoices(selected){const host=$('scheduleApps');host.replaceChildren();const opts=[...$('apps').querySelectorAll('input[type=checkbox]')];
+ if(!opts.length){host.textContent='Brak aplikacji. Najpierw odśwież listę w zakładce Kopie zapasowe.';return;}
+ for(const opt of opts){const wrapper=document.createElement('label');wrapper.className='appitem';const cb=document.createElement('input');cb.type='checkbox';cb.value=opt.value;cb.checked=Boolean(selected&&selected.includes(opt.value));
+ const cap=document.createElement('span');cap.textContent=opt.closest('label')?.querySelector('strong')?.textContent||opt.value;wrapper.append(cb,cap);host.append(wrapper);}}
+function scheduleReset(){scheduleEditing='';$('scheduleForm').reset();$('scheduleCron').value='0 2 * * *';$('schedulePreset').value='0 2 * * *';$('scheduleEnabled').checked=true;
+ $('scheduleFormTitle').textContent='Dodaj harmonogram';$('scheduleCancel').hidden=true;scheduleAppChoices([]);}
+function scheduleEdit(id){const r=scheduleRows.find(s=>s.id===id);if(!r)return;scheduleEditing=id;$('scheduleName').value=r.name;$('scheduleStorage').value=r.storage_id;
+ $('scheduleCron').value=r.cron;$('schedulePreset').value=[...$('schedulePreset').options].some(o=>o.value===r.cron)?r.cron:'custom';$('scheduleEnabled').checked=r.enabled;
+ scheduleAppChoices(r.apps);$('scheduleFormTitle').textContent='Edytuj harmonogram: '+r.name;$('scheduleCancel').hidden=false;$('scheduleForm').scrollIntoView({behavior:'smooth'});}
+async function loadSchedules(){try{const r=await api('/api/schedules');if(!r.success)throw new Error(r.message);scheduleToken=r.csrf;scheduleRows=r.schedules;
+ const body=$('scheduleRows');body.replaceChildren();if(!scheduleRows.length){const tr=body.insertRow();const td=tr.insertCell();td.colSpan=7;td.textContent='Brak harmonogramów.';}
+ for(const item of scheduleRows){const tr=body.insertRow();for(const value of [item.name,item.storage_id,item.cron,item.next_run||'—'])tr.insertCell().textContent=value;
+ const status=tr.insertCell(),badge=document.createElement('span');badge.className='schedule-tag'+(item.enabled?'':' off');badge.textContent=item.enabled?'Włączony':'Wyłączony';status.append(badge);
+ tr.insertCell().textContent=(item.last_run?item.last_run+' — ':'')+(item.last_result||'Nie uruchomiono');const action=tr.insertCell();action.className='schedule-grid-actions';
+ for(const [name,cb,bad] of [['Edytuj',()=>scheduleEdit(item.id),false],[item.enabled?'Wyłącz':'Włącz',()=>scheduleToggle(item),false],['Usuń',()=>scheduleRemove(item),true]]){
+ const button=document.createElement('button');button.type='button';button.textContent=name;button.className=bad?'danger':'secondary';button.onclick=cb;action.append(button)}}
+ }catch(e){scheduleNotice(false,'Nie udało się pobrać harmonogramów: '+e.message)}}
+async function scheduleWrite(url,method,body){const root=window.location.pathname.replace(/\/$/,'');const resp=await fetch(root+url,{method,headers:{'Content-Type':'application/json','X-Schedule-CSRF':scheduleToken},body:JSON.stringify(body)});return await resp.json();}
+async function scheduleToggle(item){try{const r=await scheduleWrite('/api/schedules/'+encodeURIComponent(item.id),'PUT',{name:item.name,cron:item.cron,storage:item.storage_id,apps:item.apps,enabled:!item.enabled});
+ scheduleNotice(Boolean(r.success),r.message);if(r.success)await loadSchedules();}catch(e){scheduleNotice(false,e.message)}}
+async function scheduleRemove(item){if(!confirm('Usunąć harmonogram "'+item.name+'"? Archiwa pozostaną na magazynie.'))return;
+ try{const r=await scheduleWrite('/api/schedules/'+encodeURIComponent(item.id),'DELETE',{});scheduleNotice(Boolean(r.success),r.message);if(r.success){if(scheduleEditing===item.id)scheduleReset();await loadSchedules();}}catch(e){scheduleNotice(false,e.message)}}
+$('schedulePreset').addEventListener('change',()=>{const v=$('schedulePreset').value;if(v!=='custom')$('scheduleCron').value=v});
+$('scheduleCron').addEventListener('input',()=>{const v=$('scheduleCron').value;$('schedulePreset').value=[...$('schedulePreset').options].some(o=>o.value===v)?v:'custom'});
+$('scheduleCancel').onclick=()=>scheduleReset();$('scheduleRefresh').onclick=loadSchedules;
+$('scheduleForm').addEventListener('submit',async event=>{event.preventDefault();const apps=[...$('scheduleApps').querySelectorAll('input:checked')].map(x=>x.value);
+ if(!apps.length){scheduleNotice(false,'Wybierz co najmniej jedną aplikację.');return}
+ const btn=$('scheduleSave');btn.disabled=true;
+ try{const payload={name:$('scheduleName').value,cron:$('scheduleCron').value,storage:$('scheduleStorage').value,apps,enabled:$('scheduleEnabled').checked};
+ const url=scheduleEditing?'/api/schedules/'+encodeURIComponent(scheduleEditing):'/api/schedules';const r=await scheduleWrite(url,scheduleEditing?'PUT':'POST',payload);
+ scheduleNotice(Boolean(r.success),r.message);if(r.success){scheduleReset();await loadSchedules();}
+ }catch(e){scheduleNotice(false,e.message)}finally{btn.disabled=false}});
+
+let updateToken='';let availableUpdate='';let repairMode=false;let updating=false;
 let updateLogOffset=0, updateLogLoading=false, updatePollLoading=false, updateLastRun='';
 function updateInfo(ok,text){const b=$('updateMessage');b.style.display='block';b.className='message '+(ok?'ok':'error');b.textContent=text}
 function showUpdateProgress(status){
@@ -1628,8 +1883,13 @@ async function checkUpdates(){
   $('versionInstalled').textContent=u.installed||'?';
   $('versionRemote').textContent=u.latest||'Brak danych';
   if(!u.success){updateInfo(false,u.message);return}
-  if(u.available){availableUpdate=u.latest;updateInfo(true,'Dostępna nowa wersja: '+u.latest);$('startUpdate').disabled=updating}
-  else updateInfo(true,'Aplikacja jest aktualna.');
+  repairMode=!u.available && u.latest===u.installed;
+  availableUpdate=(u.available||repairMode)?u.latest:'';
+  $('startUpdate').textContent=repairMode?'Zainstaluj ponownie':'Aktualizuj aplikację';
+  $('startUpdate').disabled=updating||!availableUpdate;
+  if(u.available) updateInfo(true,'Dostępna nowa wersja: '+u.latest);
+  else if(repairMode) updateInfo(true,'Aplikacja jest aktualna. W razie problemów możesz ponownie zainstalować tę samą wersję bez usuwania danych.');
+  else updateInfo(false,'Na GitHubie jest starsza wersja. Instalacja starszej wersji jest zablokowana.');
   if(u.state&&['launching','running'].includes(u.state.status)){
    updating=true;$('startUpdate').disabled=true;updateInfo(true,u.state.message);
    showUpdateProgress(u.state.status);
@@ -1644,13 +1904,13 @@ $('copyUpdateLog').onclick=async()=>{
 };
 $('startUpdate').onclick=async()=>{
  if(!availableUpdate||!updateToken)return;
- if(!confirm('Zaktualizować YunoHost Backup Manager do '+availableUpdate+'? Panel uruchomi ponownie własną usługę.'))return;
+ if(!confirm((repairMode?'Ponownie zainstalować wersję ':'Zaktualizować YunoHost Backup Manager do ')+availableUpdate+'? YunoHost wykona kopię bezpieczeństwa i uruchomi ponownie usługę wtyczki.'))return;
  $('startUpdate').disabled=true;updating=true;
  showUpdateProgress('launching');clearUpdateLog();
  updateInfo(true,'Uruchamianie aktualizacji...');
  try{
   const url=window.location.pathname.replace(/\/$/,'')+'/api/updates/start';
-  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Update-CSRF':updateToken},body:JSON.stringify({version:availableUpdate})});
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Update-CSRF':updateToken},body:JSON.stringify({version:availableUpdate,repair:repairMode})});
   const x=await r.json();
   if(!x.success){updating=false;updateInfo(false,x.message);$('startUpdate').disabled=false;showUpdateProgress('error')}
   else{updateInfo(true,'Aktualizacja uruchomiona. Komunikaty YunoHost pojawią się poniżej.');await fetchUpdateLog()}
@@ -1677,9 +1937,10 @@ async function pollUpdates(){
    if(updating||status==='error')updateInfo(status==='success',state.message+(status==='success'?' Panel działa już w nowej wersji.':''));
    updating=false;showUpdateProgress(status);await fetchUpdateLog();
    if(status==='success' && s.installed===state.target && availableUpdate===state.target){
-    availableUpdate='';$('versionInstalled').textContent=s.installed;
+    availableUpdate=repairMode?s.installed:'';$('versionInstalled').textContent=s.installed;
     $('versionRemote').textContent=s.installed;
-    $('startUpdate').disabled=true;updateInfo(true,'Aplikacja jest aktualna: '+s.installed);
+    $('startUpdate').disabled=!repairMode;
+    updateInfo(true,repairMode?'Ponowna instalacja zakończona: '+s.installed:'Aplikacja jest aktualna: '+s.installed);
    }
   }
  }catch(e){if(updating)updateInfo(true,'Trwa aktualizacja — oczekiwanie na ponowne uruchomienie panelu...')}
@@ -1689,7 +1950,9 @@ checkUpdates();pollUpdates();setInterval(pollUpdates,1700);
 backupPoll().catch(e=>msg(false,e.message));
 setInterval(()=>backupPoll().catch(()=>{}),3000);
 restorePoll().catch(()=>{});setInterval(()=>restorePoll().catch(()=>{}),3000);
-refreshApps().catch(e=>msg(false,e.message));
+refreshApps().then(()=>scheduleAppChoices([])).catch(e=>msg(false,e.message));
+loadSchedules().catch(()=>{});
+setInterval(()=>{if(location.hash==='#harmonogram')loadSchedules().catch(()=>{});},30000);
 refresh().catch(e=>msg(false,e.message));
 </script></body></html>'''
 

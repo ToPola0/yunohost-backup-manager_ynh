@@ -9,7 +9,7 @@ import time
 import urllib.request
 
 APP_ID = 'yunohost-backup-manager'
-APP_VERSION = '0.5~ynh15'
+APP_VERSION = '0.5~ynh16'
 REPOSITORY = 'https://github.com/ToPola0/yunohost-backup-manager_ynh'
 MANIFEST_URL = 'https://raw.githubusercontent.com/ToPola0/yunohost-backup-manager_ynh/main/manifest.toml'
 DATA_DIR = Path(__file__).resolve().parent / 'data'

@@ -1,6 +1,14 @@
-# YunoHost Backup Manager — 0.5~ynh15 (wersja testowa)
+# YunoHost Backup Manager — 0.5~ynh16 (wersja testowa)
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh15**
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh16**
+
+## Zmiany w 0.5~ynh16 — ponowna instalacja i Harmonogram (cron)
+
+- **Aktualizacja / naprawa:** panel pozwala ponownie zainstalować dokładnie tę samą wersję z repozytorium GitHub, nawet gdy aplikacja jest aktualna. Wykorzystywana jest natywna komenda YunoHost `app upgrade --force` i dotychczasowy log oraz kontrola wyniku. Starsze wersje nie są instalowane automatycznie. Aktualizacja nowszej wersji działa jak dotychczas.
+- **Nowa kategoria „Harmonogram (cron)”** w lewym menu. Obsługuje wiele zadań, zapis pięciopolowy cron, wygodne ustawienia codziennie/tygodniowo/miesięcznie, wybór istniejącego magazynu i aplikacji, włączanie, wyłączanie, edycję i usuwanie zadań.
+- **Wbudowany harmonogram** działa wewnątrz działającej usługi aplikacji, nie edytuje crontaba systemowego, nie modyfikuje innych usług ani konfiguracji systemu. Zadania są zapisywane w istniejącej bazie SQLite w katalogu danych wtyczki. Aktualizacja ich nie kasuje.
+- **Bezpieczne pomijanie kolizji:** jeżeli trwa tworzenie lub przywracanie kopii albo aktualizacja, zaplanowana kopia nie startuje. Wynik ostatniego uruchomienia/pominięcia i termin następnego są widoczne w tabeli. Ponowny start panelu w tej samej minucie nie uruchamia zadania dwukrotnie.
+- Harmonogram działa, gdy usługa aplikacji jest uruchomiona; pominięte terminy w czasie wyłączenia nie są uruchamiane wstecz. Czas to lokalna strefa serwera YunoHost. Wersja nadal wymaga testu na docelowym serwerze.
 
 ## Zmiany w 0.5~ynh15 — kopie i przywracanie jak w Proxmox
 
