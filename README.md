@@ -11,3 +11,5 @@ Nowa instalacja tworzy nową bazę magazynów SMB; nie importuje danych z ręczn
 Dane trzymane są w katalogu data_dir zarządzanym przez YunoHost.
 
 Skrypty sprawdzono składniowo, nie przetestowano instalacji na żywym YunoHost.
+
+Wersja ynh4: instalacja pod ścieżką /backup-manager na istniejącej domenie.
