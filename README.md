@@ -1,4 +1,13 @@
-# YunoHost Backup Manager **0.5~ynh21**
+# YunoHost Backup Manager **0.5~ynh22**
+
+## Zmiany w 0.5~ynh22 — nawigacja panelu
+
+- Logiczny porządek: **Kopie zapasowe**, **Harmonogram**, następnie **Magazyny SMB** w osobnej grupie konfiguracji.
+- **Aktualizacja** znajduje się na dole paska w sekcji aplikacji.
+- Wersja aplikacji jest pobierana z jednego źródła (`APP_VERSION`), zamiast starej, wpisanej na stałe w HTML.
+- Nowy, bardziej zwarty układ na komputerach oraz pełna nawigacja na telefonach.
+- Nie zmieniono mechanizmu tworzenia, przesyłania, przywracania ani aktualizowania kopii.
+
 
 ## Postęp pojedynczych części archiwum
 

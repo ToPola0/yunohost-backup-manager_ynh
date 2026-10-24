@@ -238,7 +238,7 @@ def public(row):
 
 @app.get('/')
 def home():
-    return render_template_string(HTML)
+    return render_template_string(HTML, app_version=APP_VERSION)
 
 
 @app.get('/api/magazyny')
@@ -2057,24 +2057,27 @@ textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border
 #importLogPanel pre{font:12px/1.55 Consolas,'Liberation Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:240px;min-height:65px;margin:0;padding:14px;color:#d8e7ff;background:#142136}
 #importLogPanel[hidden],#importProgress[hidden]{display:none}
 
-/* Panel 0.5~ynh17 — nawigacja kategoriami. */
+/* Sidebar 0.5~ynh22 — zadania na górze, ustawienia i aktualizacja oddzielnie. */
 :root{--navy:#14263e;--navy-soft:#1c3552;--primary:#2d639c;--line:#e2e8f0;--text:#20334b;--muted:#637389}
 html{min-height:100%;scroll-behavior:smooth}
 body{background:#f2f5f9;color:var(--text)}
 .app-shell{display:grid;grid-template-columns:254px minmax(0,1fr);min-height:100vh}
-.app-sidebar{background:linear-gradient(175deg,#182c46 0%,#11223a 100%);color:#e9f1fc;display:flex;flex-direction:column;padding:26px 15px 20px;min-width:0;position:sticky;top:0;height:100vh;box-shadow:3px 0 20px #16294012}
-.sidebar-brand{display:flex;align-items:center;gap:12px;padding:5px 9px 27px;border-bottom:1px solid #ffffff19;margin-bottom:25px;min-width:0}
-.sidebar-brand img{width:48px;height:48px;flex:none;object-fit:contain;border-radius:10px;background:#0f2945}
-.brand-copy{min-width:0}.brand-copy strong{display:block;font-size:15px;line-height:1.35;letter-spacing:.1px}.brand-copy small{display:block;margin-top:6px;font-size:11px;color:#aebfd4;font-weight:normal}
-.sidebar-group-label{font-size:10px;letter-spacing:1.4px;font-weight:700;color:#899fb9;padding:0 13px;margin-bottom:12px}
-.sidebar-nav{display:flex;flex-direction:column;gap:6px}
-.nav-item{display:flex;align-items:center;gap:13px;padding:13px 14px;border-radius:9px;color:#ccd8e9;text-decoration:none;font-size:14px;font-weight:600;line-height:1.3;border:1px solid transparent;transition:background .15s ease,color .15s ease,border .15s ease}
-.nav-item svg{height:21px;width:21px;flex:none;opacity:.9}
-.nav-item:hover{background:#ffffff12;color:white}
+.app-sidebar{background:linear-gradient(165deg,#192f4c 0%,#10223a 100%);color:#e9f1fc;display:flex;flex-direction:column;gap:0;padding:25px 15px 20px;min-width:0;position:sticky;top:0;height:100vh;box-shadow:3px 0 20px #16294012;overflow-y:auto}
+.sidebar-brand{display:flex;align-items:center;gap:13px;padding:4px 8px 25px;border-bottom:1px solid #ffffff24;margin-bottom:23px;min-width:0}
+.sidebar-brand img{width:47px;height:47px;flex:none;object-fit:contain;border-radius:12px;background:#0e2d4d}
+.brand-copy{min-width:0}.brand-copy strong{display:block;font-size:15px;line-height:1.3;letter-spacing:.05px}.brand-copy small{display:block;margin-top:5px;font-size:11px;color:#aebfd4;font-weight:normal}
+.sidebar-group-label{font-size:10px;letter-spacing:1.45px;font-weight:750;color:#92a7c2;padding:0 14px;margin:6px 0 9px}
+.sidebar-nav{display:flex;flex-direction:column;gap:5px}
+.sidebar-nav .sidebar-group-label:not(:first-child){margin-top:22px}
+.nav-item{display:flex;align-items:center;gap:13px;min-height:47px;padding:11px 13px;border-radius:9px;color:#d4e1f2;text-decoration:none;font-size:13.5px;font-weight:600;line-height:1.35;border:1px solid transparent;transition:background .15s ease,color .15s ease,border .15s ease}
+.nav-item svg{height:20px;width:20px;flex:none;opacity:.86}
+.nav-item:hover{background:#ffffff17;color:white}
 .nav-item:focus-visible{outline:2px solid #94cbf1;outline-offset:2px}
-.nav-item.active{background:#2b527d;color:#fff;border-color:#ffffff26;box-shadow:inset 3px 0 0 #67c2fa}
-.sidebar-bottom{margin-top:auto;padding:18px 12px 1px;font-size:11px;color:#a9b9ce;border-top:1px solid #ffffff15;display:flex;gap:8px;align-items:center}
-.sidebar-mark{background:#51b8a7;width:7px;height:7px;border-radius:50%;flex:none}
+.nav-item.active{background:#2d5279;color:#fff;border-color:#ffffff23;box-shadow:inset 3px 0 0 #66c7fd}
+.sidebar-bottom{margin-top:auto;padding:17px 0 0;border-top:1px solid #ffffff22;display:flex;flex-direction:column;gap:3px}
+.sidebar-bottom .sidebar-group-label{margin:2px 0 8px}
+.sidebar-bottom .nav-item{margin:0}
+.sidebar-version{font-size:11px;color:#92a6bf;letter-spacing:.2px;margin:15px 13px 0}
 .app-workspace{min-width:0}
 .workspace-topbar{min-height:68px;background:#fff;border-bottom:1px solid var(--line);padding:17px clamp(22px,4vw,56px);display:flex;align-items:center;justify-content:space-between;gap:12px;color:#637389;font-size:13px}
 .yunohost-home-link{color:#315f98;text-decoration:none;font-weight:700}
@@ -2091,15 +2094,19 @@ input,select,textarea{border-color:#cbd6e3}
 input:focus,select:focus,textarea:focus{outline:2px solid #80b7ee;outline-offset:1px}
 button{background:#315f98}button:hover:not(:disabled){filter:brightness(1.07)}
 button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
-@media(max-width:900px){.app-shell{grid-template-columns:210px minmax(0,1fr)}.app-sidebar{padding:21px 10px}.sidebar-brand{gap:9px;padding:5px 8px 21px}.sidebar-brand img{width:40px;height:40px}.brand-copy strong{font-size:13px}.nav-item{padding:12px 10px;gap:10px}}
+@media(max-width:900px){.app-shell{grid-template-columns:218px minmax(0,1fr)}.app-sidebar{padding:21px 11px}.sidebar-brand{gap:10px;padding:5px 7px 20px}.sidebar-brand img{width:40px;height:40px}.brand-copy strong{font-size:13px}.nav-item{padding:11px 10px;gap:10px}}
 @media(max-width:720px){
- .app-shell{display:block}.app-sidebar{position:static;height:auto;padding:13px 14px 12px;box-shadow:none}
- .sidebar-brand{margin:0 0 13px;padding:0 4px 10px;border-bottom:1px solid #ffffff1b}
- .sidebar-brand img{width:36px;height:36px}.brand-copy strong{font-size:13px;line-height:1.2}.brand-copy small{margin-top:3px}
- .sidebar-group-label,.sidebar-bottom{display:none}
- .sidebar-nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
- .nav-item{justify-content:center;gap:7px;padding:11px 6px;text-align:center;font-size:12px}
+ .app-shell{display:block}.app-sidebar{position:static;height:auto;padding:14px 15px;box-shadow:none;overflow:visible}
+ .sidebar-brand{margin:0 0 10px;padding:0 3px 12px;border-bottom:1px solid #ffffff20}
+ .sidebar-brand img{width:38px;height:38px}.brand-copy strong{font-size:13px;line-height:1.2}.brand-copy small{margin-top:3px}
+ .sidebar-group-label,.sidebar-version{display:none}
+ .sidebar-nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+ .sidebar-nav .sidebar-group-label{display:none}
+ .nav-item{justify-content:center;gap:8px;padding:11px 6px;text-align:center;font-size:12px;min-height:44px}
  .nav-item svg{width:17px;height:17px}.nav-item.active{box-shadow:inset 0 -3px 0 #67c2fa}
+ .sidebar-bottom{margin-top:8px;border-top:0;padding:0;display:block}
+ .sidebar-bottom .nav-item{width:100%;min-height:39px;background:#ffffff0a;border-color:#ffffff12}
+ .sidebar-bottom .nav-item.active{background:#2d5279}
  .workspace-topbar{min-height:48px;padding:10px 18px;font-size:12px}
  .workspace-content{padding:25px 16px 42px}.page-heading{margin-bottom:20px}.page-heading h1{font-size:25px}
  .panel{padding:19px 16px;border-radius:10px}.panel h2{font-size:18px}
@@ -2190,22 +2197,26 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 <div class="app-shell">
 <aside class="app-sidebar" aria-label="Menu aplikacji">
   <div class="sidebar-brand">
-    <img id="appLogo" alt="" width="48" height="48">
-    <div class="brand-copy"><strong>YunoHost<br>Backup Manager</strong><small>0.5~ynh19</small></div>
+    <img id="appLogo" alt="" width="47" height="47">
+    <div class="brand-copy"><strong>Backup Manager</strong><small>YunoHost</small></div>
   </div>
-  <div class="sidebar-group-label">ZARZĄDZANIE</div>
   <nav class="sidebar-nav" aria-label="Kategorie">
-<a class="nav-item active" href="#magazyn" data-view="magazyn" aria-current="page"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="18" height="7" rx="2"/><rect x="3" y="13.5" width="18" height="7" rx="2"/><path d="M7.5 7h.01M7.5 17h.01M11 7h7M11 17h7"/></svg><span>Magazyn</span></a>
-<a class="nav-item" href="#kopie" data-view="kopie"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7.5V5a2 2 0 0 1 2-2h8l4 4v12a2 2 0 0 1-2 2h-2"/><path d="M15 3v5h5M3 16a6 6 0 1 0 2-4.5"/><path d="M3 11v5h5"/></svg><span>Kopie zapasowe</span></a>
-<a class="nav-item" href="#harmonogram" data-view="harmonogram"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2M7 2v3M17 2v3"/></svg><span>Harmonogram (cron)</span></a>
-<a class="nav-item" href="#aktualizacja" data-view="aktualizacja"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V3m0 0L7.5 7.5M12 3l4.5 4.5M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg><span>Aktualizacja</span></a>
+    <div class="sidebar-group-label">KOPIE ZAPASOWE</div>
+    <a class="nav-item active" href="#kopie" data-view="kopie" aria-current="page"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7.5V5a2 2 0 0 1 2-2h8l4 4v12a2 2 0 0 1-2 2h-2"/><path d="M15 3v5h5M3 16a6 6 0 1 0 2-4.5"/><path d="M3 11v5h5"/></svg><span>Kopie zapasowe</span></a>
+    <a class="nav-item" href="#harmonogram" data-view="harmonogram"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2M7 2v3M17 2v3"/></svg><span>Harmonogram</span></a>
+    <div class="sidebar-group-label">KONFIGURACJA</div>
+    <a class="nav-item" href="#magazyn" data-view="magazyn"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3.5" width="18" height="7" rx="2"/><rect x="3" y="13.5" width="18" height="7" rx="2"/><path d="M7.5 7h.01M7.5 17h.01M11 7h7M11 17h7"/></svg><span>Magazyny SMB</span></a>
   </nav>
-  <div class="sidebar-bottom"><span class="sidebar-mark"></span> Panel kopii zapasowych</div>
+  <div class="sidebar-bottom">
+    <div class="sidebar-group-label">APLIKACJA</div>
+    <a class="nav-item" href="#aktualizacja" data-view="aktualizacja"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V3m0 0L7.5 7.5M12 3l4.5 4.5M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg><span>Aktualizacja</span></a>
+    <div class="sidebar-version">Wersja {{ app_version }}</div>
+  </div>
 </aside>
 <div class="app-workspace">
-  <header class="workspace-topbar"><nav aria-label="Ścieżka nawigacji"><a class="yunohost-home-link" href="/yunohost/admin/" title="Powrót do panelu administracyjnego YunoHost">YunoHost</a><span class="crumb-divider">/</span><span aria-current="page">Backup Manager</span></nav><span class="version-pill">v0.5~ynh19</span></header>
+  <header class="workspace-topbar"><nav aria-label="Ścieżka nawigacji"><a class="yunohost-home-link" href="/yunohost/admin/" title="Powrót do panelu administracyjnego YunoHost">YunoHost</a><span class="crumb-divider">/</span><span aria-current="page">Backup Manager</span></nav><span class="version-pill">v{{ app_version }}</span></header>
   <main class="workspace-content" id="mainContent">
-    <div class="page-heading"><span class="page-eyebrow">PANEL ZARZĄDZANIA</span><h1 id="viewTitle">Magazyn</h1><p id="viewDescription">Zarządzaj magazynami SMB/CIFS i połączeniami sieciowymi.</p></div>
+    <div class="page-heading"><span class="page-eyebrow">PANEL ZARZĄDZANIA</span><h1 id="viewTitle">Kopie zapasowe</h1><p id="viewDescription">Przeglądaj archiwa z magazynu, twórz nowe kopie i przywracaj wybrane aplikacje.</p></div>
     <div class="category-view" id="view-magazyn" data-category="magazyn">
 <section class="panel"><h2>Magazyny SMB/CIFS</h2><div class="tablewrap"><table><thead><tr><th>ID</th><th>Serwer</th><th>Udział</th><th>Protokół</th><th>Akcje</th></tr></thead><tbody id="rows"><tr><td colspan="5">Wczytywanie...</td></tr></tbody></table></div></section>
 <section class="panel"><h2 id="formTitle">Dodaj magazyn SMB/CIFS</h2><form id="form">
@@ -2322,11 +2333,11 @@ const $=id=>document.getElementById(id);let editing=null;let records=[];
 const categoryDetails={
  magazyn:{title:'Magazyn',description:'Zarządzaj magazynami SMB/CIFS i połączeniami sieciowymi.'},
  kopie:{title:'Kopie zapasowe',description:'Przeglądaj archiwa z magazynu, twórz nowe kopie i przywracaj wybrane aplikacje.'},
- harmonogram:{title:'Harmonogram (cron)',description:'Automatyczne kopie zapasowe według ustalonego terminarza.'},
+ harmonogram:{title:'Harmonogram',description:'Automatyczne kopie zapasowe według ustalonego terminarza.'},
  aktualizacja:{title:'Aktualizacja',description:'Sprawdź nową wersję aplikacji i zobacz przebieg aktualizacji.'}
 };
 function navigateCategory(name){
- const section=categoryDetails[name]?name:'magazyn';
+ const section=categoryDetails[name]?name:'kopie';
  document.querySelectorAll('.category-view').forEach(el=>{el.hidden=el.dataset.category!==section});
  document.querySelectorAll('.nav-item[data-view]').forEach(el=>{
   const active=el.dataset.view===section;
