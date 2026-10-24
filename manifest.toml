@@ -3,7 +3,7 @@ id = "yunohost-backup-manager"
 name = "YunoHost Backup Manager"
 description.en = "Back up YunoHost applications to SMB shares"
 description.pl = "Kopie zapasowe aplikacji YunoHost na udziały SMB"
-version = "0.5~ynh16"
+version = "0.5~ynh17"
 maintainers = ["ToPola0"]
 
 [upstream]

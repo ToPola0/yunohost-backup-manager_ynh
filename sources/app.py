@@ -324,6 +324,8 @@ def delete_storage(storage_id):
 BACKUP_DIR = pathlib.Path('/home/yunohost.backup/archives')
 BACKUP_LOCK = threading.Lock()
 BACKUP_STATE_GUARD = threading.RLock()
+BACKUP_REPORT = None  # only one backup can run while BACKUP_LOCK is held
+REPORT_MAX_SIZE = 1024 * 1024
 BACKUP_STATE = {'status': 'idle', 'phase': 'idle', 'percent': None,
                 'message': 'Brak uruchomionej kopii.', 'details': [],
                 'done_bytes': 0, 'total_bytes': 0, 'log': []}
@@ -340,8 +342,10 @@ def backup_event(message, phase=None, status=None, percent=None, reset=False):
             BACKUP_STATE['phase'] = phase
         if status is not None:
             BACKUP_STATE['status'] = status
-        BACKUP_STATE['log'] = (BACKUP_STATE['log'] +
-                               [time.strftime('%H:%M:%S') + '  ' + message])[-140:]
+        entry = time.strftime('%H:%M:%S') + '  ' + message
+        BACKUP_STATE['log'] = (BACKUP_STATE['log'] + [entry])[-140:]
+        if BACKUP_REPORT is not None and len(BACKUP_REPORT['events']) < 400:
+            BACKUP_REPORT['events'].append(entry)
 
 
 class BackupMeter:
@@ -456,7 +460,7 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def transfer_legacy(cfg, files, meter):
+def transfer_legacy(cfg, files, meter, hashes=None):
     with SMB_LOCK:
         with smb_endpoint(cfg['server']) as endpoint:
             conn = connect_legacy(cfg, True, endpoint.host, endpoint.port)
@@ -478,13 +482,16 @@ def transfer_legacy(cfg, files, meter):
                             verifier.count != path.stat().st_size or
                             verifier.digest.digest() != source.digest.digest()):
                         raise RuntimeError('Błąd weryfikacji SMB: ' + path.name)
+                    if hashes is not None:
+                        hashes[path.name] = {'bytes': verifier.count, 'sha256': verifier.digest.hexdigest(),
+                                             'remote_readback': True}
                     backup_event('SMB1: SHA256 zgodne dla ' + path.name,
                                  phase='transfer', percent=BACKUP_STATE['percent'])
             finally:
                 conn.close()
 
 
-def transfer_modern(cfg, files, meter):
+def transfer_modern(cfg, files, meter, hashes=None):
     cache = {}
     user = (cfg['domain'] + '\\' if cfg['domain'] else '') + cfg['username']
     with smb_endpoint(cfg['server']) as endpoint:
@@ -514,6 +521,9 @@ def transfer_modern(cfg, files, meter):
                         verifier.count != path.stat().st_size or
                         verifier.digest.digest() != source.digest.digest()):
                     raise RuntimeError('Błąd weryfikacji SMB: ' + path.name)
+                if hashes is not None:
+                    hashes[path.name] = {'bytes': verifier.count, 'sha256': verifier.digest.hexdigest(),
+                                         'remote_readback': True}
                 backup_event('SMB2/3: SHA256 zgodne dla ' + path.name,
                              phase='transfer', percent=BACKUP_STATE['percent'])
         finally:
@@ -523,7 +533,109 @@ def transfer_modern(cfg, files, meter):
                 pass
 
 
+
+def make_backup_report(name, storage_id, app_ids, app_names, hashes, started_at):
+    """Capture actual verification results; do not treat file presence as proof."""
+    with BACKUP_STATE_GUARD:
+        events = list(BACKUP_REPORT['events']) if BACKUP_REPORT else []
+    return {
+        'format': 'yunohost-backup-manager-report-v1',
+        'archive': name, 'storage': storage_id, 'started_at': started_at,
+        'verified_at': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        'status': 'verified', 'sha256': 'SHA-256',
+        'verification': 'Pełny odczyt plików z magazynu SMB i porównanie SHA256 oraz rozmiarów.',
+        'applications': [{'id': app_id, 'name': label} for app_id, label in zip(app_ids, app_names)],
+        'files': hashes, 'events': events,
+        'cleanup': 'Raport zapisano przed usunięciem lokalnego archiwum. Stan sprzątania niepotwierdzony w raporcie.',
+    }
+
+
+def upload_backup_report(cfg, name, report):
+    """Publish an accompanying JSON report only after remote SHA256 readback of it.
+
+    Never delete the locally generated backup if report upload/verification fails.
+    """
+    if not archive_name_ok(name):
+        raise ValueError('Nieprawidłowa nazwa archiwum raportu.')
+    raw = (json.dumps(report, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+    if len(raw) > REPORT_MAX_SIZE:
+        raise RuntimeError('Raport przekroczył dopuszczalny rozmiar 1 MiB.')
+    filename = name + '.report.json'
+    sha = hashlib.sha256(raw).digest()
+
+    def legacy():
+        with SMB_LOCK:
+            with smb_endpoint(cfg['server']) as endpoint:
+                conn = connect_legacy(cfg, True, endpoint.host, endpoint.port)
+                try:
+                    folder = remote_folder(cfg)
+                    target = folder + '/' + filename
+                    conn.storeFile(cfg['share'], target, io.BytesIO(raw), timeout=90)
+                    sink = io.BytesIO()
+                    conn.retrieveFile(cfg['share'], target, sink, timeout=90)
+                    if len(sink.getvalue()) != len(raw) or hashlib.sha256(sink.getvalue()).digest() != sha:
+                        raise RuntimeError('Raport SMB: niezgodne dane odczytane z magazynu.')
+                finally:
+                    conn.close()
+
+    def modern():
+        cache = {}
+        with smb_endpoint(cfg['server']) as endpoint:
+            server = endpoint.host
+            target = remote_unc(cfg, server) + '\\' + filename
+            user = (cfg['domain'] + '\\' if cfg['domain'] else '') + cfg['username']
+            try:
+                smbclient.register_session(server, username=user, password=cfg['password'],
+                                           port=endpoint.port, connection_timeout=15,
+                                           connection_cache=cache)
+                with smbclient.open_file(target, 'wb', port=endpoint.port, connection_cache=cache) as out:
+                    out.write(raw)
+                digest = hashlib.sha256()
+                length = 0
+                with smbclient.open_file(target, 'rb', port=endpoint.port, connection_cache=cache) as source:
+                    for chunk in iter(lambda: source.read(64 * 1024), b''):
+                        length += len(chunk)
+                        if length > REPORT_MAX_SIZE:
+                            raise RuntimeError('Raport SMB jest zbyt duży po odczycie.')
+                        digest.update(chunk)
+                if length != len(raw) or digest.digest() != sha:
+                    raise RuntimeError('Raport SMB: niezgodne dane odczytane z magazynu.')
+            finally:
+                try:
+                    smbclient.delete_session(server, port=endpoint.port, connection_cache=cache)
+                except Exception:
+                    pass
+
+    if cfg['protocol'] == 'smb1':
+        legacy()
+    elif cfg['protocol'] == 'smb2':
+        modern()
+    else:
+        try_protocol(cfg, legacy, modern)
+
+
+def save_backup_report_local(report):
+    """Keep an audit trail inside the application's own data directory."""
+    folder = DATA / 'reports'
+    folder.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(folder, 0o700)
+    path = folder / (report['archive'] + '.report.json')
+    temp_path = folder / ('.' + report['archive'] + '.' + uuid.uuid4().hex + '.tmp')
+    try:
+        with open(temp_path, 'x', encoding='utf-8') as dest:
+            json.dump(report, dest, ensure_ascii=False, indent=2)
+            dest.write('\n')
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def backup_worker(app_ids, storage_id, app_names):
+    global BACKUP_REPORT
+    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+    name = None
+    hashes = {}
     try:
         backup_event('Sprawdzanie wolnego miejsca i rozmiaru kopii…',
                      phase='prepare', status='running')
@@ -540,6 +652,8 @@ def backup_worker(app_ids, storage_id, app_names):
             raise RuntimeError('Za mało wolnego miejsca na kopię lokalną.')
         cfg = cfg_from_storage(storage_id)
         name = backup_archive_name(app_ids, app_names)
+        with BACKUP_STATE_GUARD:
+            BACKUP_REPORT = {'events': list(BACKUP_STATE['log'])}
         backup_event('YunoHost tworzy archiwum ' + name + ' (' + ', '.join(app_names) + ')',
                      phase='create')
         yn_command('backup', 'create', '--apps', *app_ids, '--name', name)
@@ -551,9 +665,9 @@ def backup_worker(app_ids, storage_id, app_names):
         backup_event(f'Archiwum gotowe ({total_mib:.1f} MiB). Rozpoczynam wysyłanie i kontrolę SHA256.',
                      phase='transfer', percent=0)
         if cfg['protocol'] == 'smb1':
-            transfer_legacy(cfg, files, meter)
+            transfer_legacy(cfg, files, meter, hashes)
         elif cfg['protocol'] == 'smb2':
-            transfer_modern(cfg, files, meter)
+            transfer_modern(cfg, files, meter, hashes)
         else:
             try:
                 modern_test(cfg)
@@ -561,21 +675,43 @@ def backup_worker(app_ids, storage_id, app_names):
                 backup_event('SMB2/3 niedostępny, sprawdzanie SMB1: ' + str(exc)[:200],
                              phase='transfer', percent=0)
                 legacy_test(cfg)
-                transfer_legacy(cfg, files, meter)
+                transfer_legacy(cfg, files, meter, hashes)
             else:
-                transfer_modern(cfg, files, meter)
-        backup_event('Weryfikacja ukończona. YunoHost usuwa lokalną kopię archiwum…',
+                transfer_modern(cfg, files, meter, hashes)
+        if len(hashes) != len(files):
+            raise RuntimeError('Nie uzyskano wyników SHA256 wszystkich plików archiwum.')
+        backup_event('Kontrola SHA256 wszystkich plików zakończona sukcesem. Zapis raportu przy archiwum…',
+                     phase='report', percent=None)
+        report = make_backup_report(name, storage_id, app_ids, app_names, hashes, started_at)
+        save_backup_report_local(report)
+        upload_backup_report(cfg, name, report)
+        backup_event('Raport ' + name + '.report.json zapisany na SMB i zweryfikowany SHA256.',
+                     phase='report', percent=None)
+        backup_event('Raport jest na SMB. YunoHost usuwa lokalną kopię archiwum…',
                      phase='cleanup', percent=None)
         yn_command('backup', 'delete', name, timeout=120)
         with BACKUP_STATE_GUARD:
             BACKUP_STATE['details'] = (['Aplikacje: ' + ', '.join(f'{n} ({i})' for n,i in zip(app_names,app_ids))] +
                                        [f.name for f in files])
-        backup_event('Kopia ' + name + ' przesłana, zweryfikowana (SHA256) i usunięta lokalnie.',
+        backup_event('Kopia ' + name + ' przesłana, zweryfikowana (SHA256), raport zapisany, pliki lokalne usunięte.',
                      phase='complete', status='success', percent=100)
     except Exception as exc:
         backup_event(str(exc) + ' Kopia lokalna, jeśli powstała, nie została celowo usunięta.',
                      phase='error', status='error')
+        if name and BACKUP_REPORT is not None:
+            try:
+                with BACKUP_STATE_GUARD:
+                    events = list(BACKUP_REPORT['events'])
+                save_backup_report_local({'format': 'yunohost-backup-manager-report-v1',
+                    'archive': name, 'storage': storage_id, 'started_at': started_at,
+                    'status': 'error', 'events': events,
+                    'verification': 'Kopia nie zakończyła się pełnym sukcesem. Wyniki plików obejmują tylko ukończone kontrole.',
+                    'files': hashes, 'cleanup': 'Lokalna kopia nie została celowo usunięta.'})
+            except Exception:
+                app.logger.exception('Nie zapisano lokalnego raportu błędu')
     finally:
+        with BACKUP_STATE_GUARD:
+            BACKUP_REPORT = None
         BACKUP_LOCK.release()
 
 
@@ -864,7 +1000,7 @@ def remote_archive_catalog(cfg, only=None):
                         tar_item = entries[name + '.tar']
                         info_item = entries.get(name + '.info.json')
                         record = {'name': name, 'size': int(tar_item.file_size), 'info_size': int(info_item.file_size) if info_item else 0,
-                                  'complete': bool(info_item), 'apps': [], 'app_names': {}, 'created_at': None,
+                                  'complete': bool(info_item), 'report_available': name + '.report.json' in entries, 'apps': [], 'app_names': {}, 'created_at': None,
                                   'message': ''}
                         if info_item:
                             if info_item.file_size > RESTORE_METADATA_MAX:
@@ -906,7 +1042,8 @@ def remote_archive_catalog(cfg, only=None):
                         continue
                     complete = name + '.info.json' in names_in_folder
                     record = {'name': name, 'size': size, 'complete': complete, 'info_size': 0,
-                              'apps': [], 'app_names': {}, 'created_at': None, 'message': ''}
+                              'apps': [], 'app_names': {}, 'created_at': None, 'message': '',
+                              'report_available': name + '.report.json' in names_in_folder}
                     if complete:
                         info_path = root + '\\' + name + '.info.json'
                         try:
@@ -1126,6 +1263,107 @@ def restore_worker(storage_id, name, apps, size, info_size):
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
         BACKUP_LOCK.release()
+
+
+
+def parse_backup_report(raw, name):
+    if len(raw) > REPORT_MAX_SIZE:
+        raise ValueError('Raport jest większy niż 1 MiB.')
+    report = json.loads(raw.decode('utf-8'))
+    if not isinstance(report, dict) or report.get('format') != 'yunohost-backup-manager-report-v1' or report.get('archive') != name:
+        raise ValueError('Niezgodna nazwa albo format raportu.')
+    if report.get('status') not in ('verified', 'error'):
+        raise ValueError('Raport ma nieznany wynik.')
+    events = report.get('events')
+    if not isinstance(events, list) or len(events) > 400 or any(not isinstance(x, str) or len(x) > 3000 for x in events):
+        raise ValueError('Nieprawidłowy dziennik operacji.')
+    files = report.get('files', {})
+    if not isinstance(files, dict) or len(files) > 4:
+        raise ValueError('Nieprawidłowe sumy kontrolne.')
+    normalized = {}
+    for filename, item in files.items():
+        if not isinstance(filename, str) or filename not in (name + '.tar', name + '.info.json') or not isinstance(item, dict):
+            raise ValueError('Nieprawidłowy plik w raporcie.')
+        digest, size = item.get('sha256'), item.get('bytes')
+        if not isinstance(digest, str) or not re.fullmatch('[a-f0-9]{64}', digest) or not isinstance(size, int) or size < 0:
+            raise ValueError('Nieprawidłowa suma SHA256.')
+        normalized[filename] = {'sha256': digest, 'bytes': size, 'remote_readback': bool(item.get('remote_readback'))}
+    if report['status'] == 'verified' and (len(normalized) != 2 or any(not x['remote_readback'] for x in normalized.values())):
+        raise ValueError('Raport nie potwierdza weryfikacji obu plików.')
+    applications = report.get('applications', [])
+    if not isinstance(applications, list) or len(applications) > 100 or any(
+            not isinstance(item, dict) or not isinstance(item.get('id'), str) or
+            not isinstance(item.get('name'), str) or len(item['id']) > 100 or len(item['name']) > 200
+            for item in applications):
+        raise ValueError('Nieprawidłowa lista aplikacji w raporcie.')
+    return {'archive': name, 'status': report['status'], 'started_at': str(report.get('started_at', ''))[:50],
+            'verified_at': str(report.get('verified_at', ''))[:50], 'storage': str(report.get('storage', ''))[:50],
+            'verification': str(report.get('verification', ''))[:400], 'applications': applications,
+            'files': normalized, 'events': events, 'cleanup': str(report.get('cleanup', ''))[:400]}
+
+
+def remote_backup_report(cfg, name):
+    if not archive_name_ok(name):
+        raise ValueError('Nieprawidłowa nazwa kopii.')
+    filename = name + '.report.json'
+
+    def legacy():
+        with SMB_LOCK:
+            with smb_endpoint(cfg['server']) as endpoint:
+                conn = connect_legacy(cfg, True, endpoint.host, endpoint.port)
+                try:
+                    folder = remote_folder(cfg)
+                    entries = conn.listPath(cfg['share'], folder + '/' if folder else '/', timeout=45)
+                    matching = [x for x in entries if x.filename == filename and not x.isDirectory]
+                    if not matching:
+                        return None
+                    if matching[0].file_size > REPORT_MAX_SIZE:
+                        raise ValueError('Raport jest zbyt duży.')
+                    sink = io.BytesIO()
+                    conn.retrieveFile(cfg['share'], folder + '/' + filename, sink, timeout=45)
+                    return parse_backup_report(sink.getvalue(), name)
+                finally:
+                    conn.close()
+
+    def modern():
+        cache = {}
+        with smb_endpoint(cfg['server']) as endpoint:
+            server = endpoint.host
+            root = remote_unc(cfg, server)
+            user = (cfg['domain'] + '\\' if cfg['domain'] else '') + cfg['username']
+            try:
+                smbclient.register_session(server, username=user, password=cfg['password'],
+                                           port=endpoint.port, connection_timeout=15, connection_cache=cache)
+                if filename not in smbclient.listdir(root, port=endpoint.port, connection_cache=cache):
+                    return None
+                target = root + '\\' + filename
+                if smbclient.stat(target, port=endpoint.port, connection_cache=cache).st_size > REPORT_MAX_SIZE:
+                    raise ValueError('Raport jest zbyt duży.')
+                with smbclient.open_file(target, 'rb', port=endpoint.port, connection_cache=cache) as f:
+                    return parse_backup_report(f.read(REPORT_MAX_SIZE + 1), name)
+            finally:
+                try:
+                    smbclient.delete_session(server, port=endpoint.port, connection_cache=cache)
+                except Exception:
+                    pass
+
+    return try_protocol(cfg, legacy, modern)
+
+
+@app.get('/api/backup/report')
+def backup_report():
+    storage_id, name = request.args.get('storage', ''), request.args.get('name', '')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,49}', storage_id) or not archive_name_ok(name):
+        return jsonify(success=False, message='Nieprawidłowy magazyn lub archiwum.'), 400
+    try:
+        cfg = cfg_from_storage(storage_id)
+        report = remote_backup_report(cfg, name)
+        if report is None:
+            return jsonify(success=True, report=None,
+                           message='Ta kopia nie ma dołączonego raportu. Dla starszych archiwów nie można potwierdzić historycznej weryfikacji SHA256.'), 200
+        return jsonify(success=True, report=report)
+    except Exception as exc:
+        return jsonify(success=False, message='Nie można odczytać raportu: ' + str(exc)[:350]), 400
 
 
 @app.get('/api/restore/archives')
@@ -1361,7 +1599,7 @@ textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border
 #importLogPanel pre{font:12px/1.55 Consolas,'Liberation Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:240px;min-height:65px;margin:0;padding:14px;color:#d8e7ff;background:#142136}
 #importLogPanel[hidden],#importProgress[hidden]{display:none}
 
-/* Panel 0.5~ynh16 — nawigacja kategoriami. */
+/* Panel 0.5~ynh17 — nawigacja kategoriami. */
 :root{--navy:#14263e;--navy-soft:#1c3552;--primary:#2d639c;--line:#e2e8f0;--text:#20334b;--muted:#637389}
 html{min-height:100%;scroll-behavior:smooth}
 body{background:#f2f5f9;color:var(--text)}
@@ -1419,6 +1657,18 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 .archive-table tbody tr.selected{background:#e8f2ff}
 .archive-table td{font-size:13px;vertical-align:middle}
 .archive-table .archive-name{font-weight:700;word-break:break-word}
+.archive-name button{border:0;background:transparent;color:#215e9b;font-weight:700;font-size:inherit;text-align:left;padding:2px 0;text-decoration:underline;text-underline-offset:3px;cursor:pointer}
+.archive-table tbody tr{cursor:pointer}.archive-table tbody tr:hover{background:#f4f8fc}
+.archive-report-status{font-size:12px;color:#576f88}
+.report-dialog{border:1px solid #d7dfeb;border-radius:12px;padding:25px;width:min(780px,calc(100% - 26px));max-height:92vh;overflow-y:auto;box-shadow:0 20px 70px #162b4780;background:white;color:#253954}
+.report-dialog::backdrop{background:#172739ae}
+.report-dialog h2{font-size:21px;margin:0 0 15px;overflow-wrap:anywhere}
+.report-grid{display:grid;grid-template-columns:160px minmax(0,1fr);gap:9px 14px;margin:16px 0;font-size:13px;overflow-wrap:anywhere}
+.report-grid dt{color:#62758b}.report-grid dd{margin:0;font-weight:600}
+.report-hash{font:12px/1.5 Consolas,monospace;overflow-wrap:anywhere;display:block}
+.report-log{font:12px/1.6 Consolas,monospace;background:#142136;color:#d8e7ff;padding:16px;border-radius:7px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:330px;overflow:auto}
+@media(max-width:550px){.report-grid{grid-template-columns:1fr;gap:3px}.report-grid dd{margin-bottom:10px}}
+
 .archive-table .archive-apps{max-width:260px;color:#52657e}
 .archive-table .archive-status{font-size:12px;color:#39785e}
 .archive-table .archive-status.bad{color:#a33939}
@@ -1457,7 +1707,7 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 <aside class="app-sidebar" aria-label="Menu aplikacji">
   <div class="sidebar-brand">
     <img id="appLogo" alt="" width="48" height="48">
-    <div class="brand-copy"><strong>YunoHost<br>Backup Manager</strong><small>0.5~ynh16</small></div>
+    <div class="brand-copy"><strong>YunoHost<br>Backup Manager</strong><small>0.5~ynh17</small></div>
   </div>
   <div class="sidebar-group-label">ZARZĄDZANIE</div>
   <nav class="sidebar-nav" aria-label="Kategorie">
@@ -1469,7 +1719,7 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
   <div class="sidebar-bottom"><span class="sidebar-mark"></span> Panel kopii zapasowych</div>
 </aside>
 <div class="app-workspace">
-  <header class="workspace-topbar"><span>YunoHost <span class="crumb-divider">/</span> Backup Manager</span><span class="version-pill">v0.5~ynh16</span></header>
+  <header class="workspace-topbar"><span>YunoHost <span class="crumb-divider">/</span> Backup Manager</span><span class="version-pill">v0.5~ynh17</span></header>
   <main class="workspace-content" id="mainContent">
     <div class="page-heading"><span class="page-eyebrow">PANEL ZARZĄDZANIA</span><h1 id="viewTitle">Magazyn</h1><p id="viewDescription">Zarządzaj magazynami SMB/CIFS i połączeniami sieciowymi.</p></div>
     <div class="category-view" id="view-magazyn" data-category="magazyn">
@@ -1495,7 +1745,7 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 <tbody id="archiveRows"><tr><td colspan="6">Wybierz magazyn, aby wyświetlić archiwa.</td></tr></tbody></table></div>
 <div class="archive-actions"><span class="archive-selection" id="archiveSelection">Nie wybrano archiwum.</span>
 <button type="button" id="restoreSelected" disabled>Przywróć wybraną kopię</button></div>
-<p class="archive-help">Wykaz pochodzi bezpośrednio z magazynu SMB. Przywracanie pobiera wybrane archiwum, a następnie uruchamia mechanizm YunoHost. Aplikacja nie usuwa ani nie nadpisuje istniejących instalacji.</p>
+<p class="archive-help">Kliknij nazwę kopii, aby zobaczyć jej raport i przebieg wykonywania. Kopie sprzed wersji 0.5~ynh17 mogą nie mieć raportu. Wykaz pochodzi bezpośrednio z magazynu SMB. Przywracanie pobiera wybrane archiwum, a następnie uruchamia mechanizm YunoHost. Aplikacja nie usuwa ani nie nadpisuje istniejących instalacji.</p>
 <div id="archiveMessage" class="message"></div>
 <div class="backup-create-panel" id="backupCreatePanel" hidden>
 <h2>Nowa kopia zapasowa</h2>
@@ -1521,6 +1771,11 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
   <div id="restoreTrack" class="update-track" role="progressbar" aria-label="Postęp przywracania" aria-valuetext="Trwa przywracanie"><span id="restoreFill" class="update-progress-fill"></span></div>
 </div><details id="restoreLogPanel" hidden open><summary>Podgląd przywracania (log YunoHost)</summary><pre id="restoreLogText" role="log" aria-label="Log przywracania"></pre></details>
 <div id="restoreMessage" class="message"></div></section>
+<dialog class="report-dialog" id="reportDialog" aria-labelledby="reportDialogHeading">
+<h2 id="reportDialogHeading">Raport wykonania kopii</h2>
+<div id="reportBody" role="status">Wczytywanie raportu…</div>
+<div class="actions"><button type="button" class="secondary" id="closeReport">Zamknij</button></div>
+</dialog>
 <dialog class="restore-dialog" id="restoreDialog" aria-labelledby="restoreDialogHeading"><h2 id="restoreDialogHeading">Przywracanie archiwum</h2>
 <p id="restoreDialogName"></p><p>Wybierz aplikacje z archiwum:</p><div id="restoreApps"></div>
 <div class="restore-alert" id="restoreWarning">YunoHost nie pozwala przywrócić aplikacji na już zainstalowaną instancję. Istniejące aplikacje nie zostaną usunięte.</div>
@@ -1547,7 +1802,7 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
     </div>
     <div class="category-view" id="view-aktualizacja" data-category="aktualizacja" hidden>
 <section class="panel" id="updatePanel"><h2>Aktualizacje aplikacji</h2>
-<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh16</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
+<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh17</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
 <div id="updateMessage" class="message" style="display:none"></div>
 <div class="actions"><button type="button" id="checkUpdate" class="secondary">Sprawdź aktualizacje</button><button type="button" id="startUpdate" disabled>Aktualizuj aplikację</button></div>
 <div id="updateProgress" hidden>
@@ -1659,20 +1914,66 @@ function showArchiveRows(){const target=$('archiveRows');target.replaceChildren(
   const radio=document.createElement('input');radio.type='radio';radio.name='archive-choice';radio.value=item.name;
   radio.checked=item.name===selectedArchive;radio.setAttribute('aria-label','Wybierz '+item.name);
   row.insertCell().append(radio);
-  const name=row.insertCell();name.className='archive-name';name.textContent=item.name;
+  const name=row.insertCell();name.className='archive-name';
+  const details=document.createElement('button');details.type='button';details.textContent=item.name;
+  details.title='Otwórz raport tworzenia kopii';details.onclick=e=>{e.stopPropagation();selectedArchive=item.name;showArchiveRows();openArchiveReport(item.name)};name.append(details);
   row.insertCell().textContent=archiveTime(item);
   row.insertCell().textContent=readableSize(item.size);
   const apps=row.insertCell();apps.className='archive-apps';apps.textContent=item.apps?.length?item.apps.map(id=>(item.app_names&&item.app_names[id])||id).join(', '):'Brak informacji';
   const status=row.insertCell();status.className='archive-status'+((!item.complete||item.message)?' bad':'');
-  status.textContent=item.message||(item.conflicts?.length?'Aplikacja już zainstalowana':'Gotowe');
+  status.textContent=item.message||(item.report_available?'Raport dostępny':'Brak raportu');
+  status.title=item.report_available?'Kliknij archiwum, aby zobaczyć weryfikację SHA256.':'Brak raportu nie jest dowodem poprawnej weryfikacji SHA256.';
   const choose=()=>{selectedArchive=item.name;showArchiveRows()};
-  row.addEventListener('click',choose);radio.addEventListener('change',choose);
+  row.addEventListener('click',event=>{if(event.target===radio)return;choose();openArchiveReport(item.name)});
+  radio.addEventListener('click',event=>event.stopPropagation());radio.addEventListener('change',choose);
  }
  const selected=archiveRecords.find(a=>a.name===selectedArchive);
  const okay=Boolean(selected&&selected.complete&&!selected.message&&selected.apps?.length&&!restoreRunning);
  $('restoreSelected').disabled=!okay;
  $('archiveSelection').textContent=selected?'Wybrano: '+selected.name:'Nie wybrano archiwum.';
 }
+function reportField(list,label,value){
+ const dt=document.createElement('dt');dt.textContent=label;
+ const dd=document.createElement('dd');dd.textContent=value||'—';list.append(dt,dd);
+}
+async function openArchiveReport(name){
+ const dialog=$('reportDialog'),body=$('reportBody');
+ $('reportDialogHeading').textContent='Raport: '+name;
+ body.replaceChildren();body.textContent='Pobieranie raportu z magazynu SMB…';
+ if(!dialog.open)dialog.showModal();
+ try{
+  const storage=$('backupStorage').value;
+  const response=await api('/api/backup/report?storage='+encodeURIComponent(storage)+'&name='+encodeURIComponent(name));
+  if(!response.success)throw new Error(response.message||'Nie można otworzyć raportu.');
+  body.replaceChildren();
+  if(!response.report){
+   const alert=document.createElement('div');alert.className='restore-alert';
+   alert.textContent=response.message||'Brak raportu. Nie można potwierdzić weryfikacji SHA256.';
+   body.append(alert);return;
+  }
+  const r=response.report;
+  const banner=document.createElement('div');banner.className='message '+(r.status==='verified'?'ok':'error');
+  banner.style.display='block';banner.textContent=r.status==='verified'?'Weryfikacja SHA256 potwierdzona — pliki na SMB zostały w całości odczytane i porównane.':'Operacja nie została pomyślnie zweryfikowana.';
+  body.append(banner);
+  const values=document.createElement('dl');values.className='report-grid';
+  reportField(values,'Archiwum',r.archive);reportField(values,'Magazyn',r.storage);
+  reportField(values,'Rozpoczęto',r.started_at);reportField(values,'Zweryfikowano',r.verified_at);
+  reportField(values,'Aplikacje',(r.applications||[]).map(x=>x.name+' ('+x.id+')').join(', '));
+  reportField(values,'Sposób weryfikacji',r.verification);
+  reportField(values,'Kopia lokalna',r.cleanup);
+  body.append(values);
+  const title=document.createElement('h3');title.textContent='Pliki i sumy SHA256';body.append(title);
+  const fileEntries=Object.entries(r.files||{});
+  if(!fileEntries.length){const p=document.createElement('p');p.textContent='Brak potwierdzonych sum SHA256.';body.append(p)}
+  for(const [file,meta] of fileEntries){
+   const para=document.createElement('p');para.textContent=file+' — '+readableSize(meta.bytes);body.append(para);
+   const code=document.createElement('code');code.className='report-hash';code.textContent='SHA256: '+meta.sha256;body.append(code);
+  }
+  const logHeader=document.createElement('h3');logHeader.textContent='Przebieg wykonywania kopii';body.append(logHeader);
+  const log=document.createElement('pre');log.className='report-log';log.textContent=(r.events||[]).join('\n')||'Brak zapisanych zdarzeń.';body.append(log);
+ }catch(e){body.replaceChildren();const notice=document.createElement('div');notice.className='message error';notice.style.display='block';notice.textContent=e.message;body.append(notice)}
+}
+$('closeReport').onclick=()=>$('reportDialog').close();
 async function refreshArchives(){
  const storage=$('backupStorage').value;
  selectedArchive='';archiveRecords=[];restoreToken='';
@@ -1767,7 +2068,7 @@ async function backupPoll(){
  if(s.status==='running')backupWasRunning=true;else if(backupWasRunning && s.status==='success'){backupWasRunning=false;refreshArchives().catch(()=>{})}else if(s.status==='error')backupWasRunning=false;
  progress.hidden=false;logPanel.hidden=false;track.className='update-track';fill.style.width='';
  const names={prepare:'Sprawdzanie miejsca',create:'Tworzenie archiwum YunoHost',
-              transfer:'Transfer i weryfikacja SMB',cleanup:'Usuwanie kopii lokalnej',
+              transfer:'Transfer i weryfikacja SMB',report:'Zapis raportu SHA256',cleanup:'Usuwanie kopii lokalnej',
               complete:'Kopia zakończona',error:'Błąd tworzenia kopii'};
  $('backupStage').textContent=names[s.phase]||'Tworzenie kopii';
  if(s.status==='success'){

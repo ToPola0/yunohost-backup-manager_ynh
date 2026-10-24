@@ -1,6 +1,21 @@
-# YunoHost Backup Manager — 0.5~ynh16 (wersja testowa)
+# YunoHost Backup Manager **0.5~ynh17**
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh16**
+## Nowości: raport wykonania każdej kopii
+
+- Dla nowo tworzonych kopii na SMB obok plików `<archiwum>.tar` i `<archiwum>.info.json` zapisywany jest **`<archiwum>.report.json`** — zapisany wraz z danym archiwum raport wykonania.
+- Raport zawiera aplikacje, datę, historię etapów tworzenia, przesyłania i weryfikacji, rozmiar obu plików oraz ich **rzeczywiste sumy SHA256** potwierdzone przez ponowny odczyt z SMB. Także plik raportu jest odczytywany po wysłaniu i porównywany sumą SHA256.
+- Kliknięcie archiwum w zakładce **Kopie zapasowe** otwiera okno jego raportu bez pobierania całego `.tar`. Można też zaznaczyć archiwum do przywrócenia radioprzyciskiem.
+- Lokalna kopia YunoHost jest usuwana dopiero po zapisaniu i weryfikacji raportu na SMB. Jeśli publikacja raportu nie powiedzie się, operacja kończy się błędem, a lokalne archiwum nie jest celowo usuwane.
+- Przy nieudanych operacjach raport błędu zapisywany jest lokalnie w katalogu **danych wtyczki**, jeżeli nadano już nazwę archiwum; brak łączności z SMB może uniemożliwić dołączenie go do zdalnej kopii.
+- **Archiwa z poprzednich wersji nie otrzymują sztucznego potwierdzenia**: panel pokazuje „Brak raportu. Nie można potwierdzić historycznej weryfikacji SHA256”.
+- Raport potwierdza integralność w chwili wykonania kopii, a **nie aktualną integralność w momencie przywracania**. Bez zmian pozostaje standardowa procedura przywracania YunoHost.
+- Modyfikacje są ograniczone wyłącznie do plików wtyczki; bez zmian systemowych, sieci, OMV, Tailscale i Proxmoxa.
+
+---
+
+## Historia: 0.5~ynh16 — poprzednia wersja
+
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh17**
 
 ## Zmiany w 0.5~ynh16 — ponowna instalacja i Harmonogram (cron)
 
