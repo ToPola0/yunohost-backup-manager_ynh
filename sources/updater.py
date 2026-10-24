@@ -9,7 +9,7 @@ import time
 import urllib.request
 
 APP_ID = 'yunohost-backup-manager'
-APP_VERSION = '0.5~ynh8'
+APP_VERSION = '0.5~ynh10'
 REPOSITORY = 'https://github.com/ToPola0/yunohost-backup-manager_ynh'
 MANIFEST_URL = 'https://raw.githubusercontent.com/ToPola0/yunohost-backup-manager_ynh/main/manifest.toml'
 DATA_DIR = Path(__file__).resolve().parent / 'data'
@@ -68,3 +68,38 @@ def write_state(**state):
             os.unlink(name)
         except FileNotFoundError:
             pass
+
+
+def read_log_chunk(offset=0, limit=65536):
+    """Return a bounded portion of the current updater output. No OS logs accessed."""
+    limit = max(1, min(int(limit), 65536))
+    try:
+        with LOG_FILE.open('rb') as log:
+            size = os.fstat(log.fileno()).st_size
+            reset = offset > size
+            if reset:
+                offset = 0
+            skipped = False
+            if offset == 0 and size > 262144:
+                # Avoid transferring enormous logs after reopening the panel.
+                offset = size - 262144
+                skipped = True
+            log.seek(offset)
+            data = log.read(limit)
+            # Keep a UTF-8 character split at a chunk boundary for the next poll.
+            while data:
+                try:
+                    text = data.decode('utf-8')
+                    break
+                except UnicodeDecodeError as exc:
+                    if exc.reason == 'unexpected end of data':
+                        data = data[:exc.start]
+                    else:
+                        text = data.decode('utf-8', errors='replace')
+                        break
+            else:
+                text = ''
+            return {'text': text, 'next_offset': offset + len(data), 'size': size,
+                    'reset': reset, 'skipped': skipped}
+    except FileNotFoundError:
+        return {'text': '', 'next_offset': 0, 'size': 0, 'reset': offset != 0, 'skipped': False}

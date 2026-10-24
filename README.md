@@ -1,8 +1,28 @@
-# YunoHost Backup Manager — 0.5~ynh8 (wersja testowa)
+# YunoHost Backup Manager — 0.5~ynh10 (wersja testowa)
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh8**
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh10**
 
-Natywna aplikacja YunoHost 12.1, wykonująca i weryfikująca kopie na udziałach SMB1/SMB2/SMB3.
+## Co nowego w 0.5~ynh10
+
+- W panelu aktualizacji wyświetla się **podgląd prawdziwego logu YunoHost na żywo**, z możliwością skopiowania komunikatów.
+- Podczas instalacji aktualizacji działa **animowany pasek aktywności**. Nie pokazuje fikcyjnego procentu; po zakończeniu zmienia się w komunikat sukcesu lub błędu.
+- Podgląd aktualizacji odtwarza stan i historię po restarcie usługi WWW. Log jest przechowywany wyłącznie w katalogu danych aplikacji.
+- Panel wyświetla przygotowaną ikonę aplikacji, dołączoną do pakietu. Nie wymaga modyfikacji konfiguracji YunoHost.
+- Zachowano magazyny SMB, szyfrowane hasła oraz aktualizator YunoHost.
+
+**Aktualizacja:** wgraj wszystkie pliki archiwum do gałęzi `main` w repozytorium `https://github.com/ToPola0/yunohost-backup-manager_ynh`, następnie wybierz w zainstalowanym panelu **Sprawdź aktualizacje → Aktualizuj aplikację**.
+
+**Uwaga:** log na żywo i pasek aktywności będą dostępne od uruchomienia wersji 0.5~ynh10, czyli podczas *następnej* aktualizacji. Przy przejściu z 0.5~ynh9 stary panel nadal korzysta ze starego mechanizmu wyświetlania.
+
+## Historia zmian
+
+## Poprawka w wersji 0.5~ynh9
+
+- Naprawiono zapisywanie magazynu SMB2/SMB3, gdy wskazany podkatalog już istnieje. Wcześniej `smbclient.mkdir()` zgłaszał `SMBOSError: [Errno 17] File exists`, mimo poprawnego testu odczytu i zapisu.
+- Kod akceptuje jedynie błąd `EEXIST`, następnie sprawdza dostęp do katalogu; inne błędy nadal przerywają operację.
+- Poprawiono numer wersji wyświetlany w nagłówku panelu.
+- Zachowano dane magazynów, hasła i mechanizm aktualizacji aplikacji.
+- Poprawki obejmują tylko pliki wtyczki, bez zmiany systemu, sieci, Tailscale, Proxmoxa ani OMV.
 
 ## Poprawka w wersji 0.5~ynh8
 
@@ -21,7 +41,7 @@ Natywna aplikacja YunoHost 12.1, wykonująca i weryfikująca kopie na udziałach
 - Nie wykonuje aktualizacji w trakcie tworzenia kopii zapasowej.
 - Zachowano wszystkie funkcje 0.5~ynh6, w tym obsługę SMB przez `tailscale nc` w ramach aplikacji.
 
-## Aktualizacja z wersji 0.5~ynh7
+## Aktualizacja z wersji 0.5~ynh8
 
 1. Rozpakuj całe archiwum ZIP i zastąp pliki w gałęzi `main`: https://github.com/ToPola0/yunohost-backup-manager_ynh
 2. W panelu wtyczki wybierz **Sprawdź aktualizacje**, a następnie **Aktualizuj aplikację**. Nie odinstalowuj jej.

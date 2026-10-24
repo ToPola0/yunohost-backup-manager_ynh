@@ -1,10 +1,11 @@
-from flask import Flask, jsonify, render_template_string, request, session
+from flask import Flask, jsonify, render_template_string, request, session, send_file
 from cryptography.fernet import Fernet
 from smb.SMBConnection import SMBConnection
 from smb import smb_structs
 from smb_transport import smb_endpoint
 import smbclient
 import sqlite3
+import errno
 import threading
 import pathlib
 import os
@@ -17,7 +18,7 @@ import hashlib
 import time
 import hmac
 import secrets
-from updater import APP_VERSION, check_remote, read_state, write_state
+from updater import APP_VERSION, check_remote, read_state, write_state, read_log_chunk, LOG_FILE
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
@@ -141,9 +142,12 @@ def ensure_modern_dirs(cfg, cache, server, port):
         root += '\\' + part
         try:
             smbclient.mkdir(root, port=port, connection_cache=cache)
-        except FileExistsError:
-            pass
-        # Confirm that the path exists and is accessible.
+        except OSError as exc:
+            # smbprotocol raises SMBOSError(errno=EEXIST), not FileExistsError,
+            # for STATUS_OBJECT_NAME_COLLISION on an existing directory.
+            if exc.errno != errno.EEXIST:
+                raise
+        # Also reject collisions with ordinary files and inaccessible directories.
         smbclient.listdir(root, port=port, connection_cache=cache)
 
 
@@ -544,6 +548,19 @@ def updates_status():
     return jsonify(success=True, installed=APP_VERSION, state=read_state())
 
 
+@app.get('/api/updates/log')
+def updates_log():
+    raw_offset = request.args.get('offset', '0')
+    if not re.fullmatch(r'[0-9]{1,15}', raw_offset):
+        return jsonify(success=False, message='Nieprawidłowa pozycja logu.'), 400
+    return jsonify(success=True, **read_log_chunk(int(raw_offset)))
+
+
+@app.get('/logo.png')
+def app_icon():
+    return send_file(ROOT / 'logo.png', mimetype='image/png', max_age=86400)
+
+
 @app.post('/api/updates/start')
 def updates_start():
     if not on_yunohost():
@@ -572,6 +589,9 @@ def updates_start():
             return jsonify(success=False, message='Brak uruchamiacza aktualizacji w pakiecie.'), 500
         if BACKUP_LOCK.locked():
             return jsonify(success=False, message='W międzyczasie rozpoczęła się kopia zapasowa.'), 409
+        # Only the app's own last-update log is cleared for a fresh run.
+        with open(LOG_FILE, 'wb'):
+            pass
         write_state(status='launching', target=expected_version,
                     started_at=int(time.time()), message='Uruchamianie aktualizacji YunoHost...')
         unit = 'yunohost-backup-manager-upd-' + uuid.uuid4().hex[:12]
@@ -604,11 +624,33 @@ h2{margin:0 0 20px}label{display:block;font-weight:bold;margin:14px 0 6px}input,
 button{background:#315b92;color:white;border:0;border-radius:5px;padding:11px 17px;cursor:pointer;font:inherit}button.secondary{background:#53677e}button.danger{background:#a83232}button:disabled{opacity:.5;cursor:wait}
 .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.message{white-space:pre-wrap;margin-top:18px;padding:13px;border-radius:5px;display:none}.ok{background:#dff2e5;color:#176331}.error{background:#fbe5e5;color:#8a2525}
 textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border-radius:5px;font:13px monospace} .appitem{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #e4e8ef}.appitem input{width:auto}.appitem small{display:block;margin-top:3px}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:12px 8px;border-bottom:1px solid #e4e8ef}td button{padding:7px 10px;margin:2px}small{color:#657286}.tablewrap{overflow-x:auto}
-</style></head><body><header>YunoHost Backup Manager <small style="color:#cad5e5">0.5~ynh7</small></header><main>
+
+/* Aktualizacja: animacja pracy bez fałszywych procentów. */
+#updateProgress{margin-top:18px}
+.update-progress-caption{display:flex;justify-content:space-between;gap:12px;align-items:center;font-size:13px;color:#415773;margin:0 0 8px}
+.update-track{height:10px;border-radius:999px;background:#e3eaf2;position:relative;overflow:hidden}
+.update-progress-fill{position:absolute;top:0;bottom:0;width:35%;left:-35%;border-radius:999px;background:linear-gradient(90deg,#38a8dc,#305a9c);animation:ynh-work 1.65s ease-in-out infinite}
+@keyframes ynh-work{to{left:100%}}
+.update-track.complete .update-progress-fill{animation:none;left:0;width:100%;background:#2f9b60}
+.update-track.failed .update-progress-fill{animation:none;left:0;width:100%;background:#c24343}
+#updateLogPanel{margin-top:14px;border:1px solid #d8e0eb;border-radius:7px;overflow:hidden}
+#updateLogPanel summary{cursor:pointer;user-select:none;padding:12px 14px;font-weight:600;background:#f1f5fa;color:#334d71}
+#updateLogPanel pre{font:12px/1.55 Consolas,'Liberation Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:320px;min-height:90px;margin:0;padding:14px;color:#d8e7ff;background:#142136}
+#updateLogPanel .actions{margin:0;padding:8px 10px;background:#f1f5fa}
+#updateLogPanel .actions button{padding:7px 12px;font-size:12px}
+#updateLogPanel[hidden],#updateProgress[hidden]{display:none}
+</style></head><body><header style="display:flex;align-items:center;gap:12px"><img id="appLogo" alt="" width="48" height="48" style="border-radius:9px;object-fit:contain"><span>YunoHost Backup Manager <small style="color:#cad5e5">0.5~ynh10</small></span></header><main>
 <section class="panel" id="updatePanel"><h2>Aktualizacje aplikacji</h2>
-<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh7</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
+<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh10</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
 <div id="updateMessage" class="message" style="display:none"></div>
 <div class="actions"><button type="button" id="checkUpdate" class="secondary">Sprawdź aktualizacje</button><button type="button" id="startUpdate" disabled>Aktualizuj aplikację</button></div>
+<div id="updateProgress" hidden>
+  <div class="update-progress-caption"><strong id="updateStage">Aktualizacja w toku</strong><span id="updatePhase">YunoHost wykonuje aktualizację…</span></div>
+  <div id="updateTrack" class="update-track" role="progressbar" aria-label="Stan aktualizacji" aria-valuetext="Trwa aktualizacja"><span class="update-progress-fill"></span></div>
+</div>
+<details id="updateLogPanel" hidden><summary>Podgląd przebiegu aktualizacji (log YunoHost)</summary>
+<pre id="updateLogText" role="log" aria-label="Log aktualizacji">Oczekiwanie na komunikaty YunoHost…</pre>
+<div class="actions"><button type="button" id="copyUpdateLog" class="secondary">Kopiuj log</button></div></details>
 <p><small>Aktualizacja korzysta z mechanizmu YunoHost. Podczas jej wykonywania panel może być chwilowo niedostępny. Zapisane magazyny i hasła pozostają w katalogu danych aplikacji.</small></p>
 </section>
 <section class="panel"><h2>Magazyny SMB/CIFS</h2><div class="tablewrap"><table><thead><tr><th>ID</th><th>Serwer</th><th>Udział</th><th>Protokół</th><th>Akcje</th></tr></thead><tbody id="rows"><tr><td colspan="5">Wczytywanie...</td></tr></tbody></table></div></section>
@@ -635,6 +677,7 @@ textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border
 <div id="appsMessage" class="message"></div><div id="backupMessage" class="message"></div></section>
 </main><script>
 const $=id=>document.getElementById(id);let editing=null;let records=[];
+$('appLogo').src=window.location.pathname.replace(/\/$/,'')+'/logo.png';
 function msg(ok,s){$('message').style.display='block';$('message').className='message '+(ok?'ok':'error');$('message').textContent=s}
 function data(){return Object.fromEntries(new FormData($('form')))}
 async function api(url,method='GET',payload){const base=window.location.pathname.replace(/\/$/,'');const r=await fetch(base+url,{method,headers:{'Content-Type':'application/json'},body:payload?JSON.stringify(payload):undefined});return await r.json()}
@@ -675,47 +718,100 @@ $('runBackup').onclick=async()=>{
  if(!r.success)alert(r.message);await backupPoll();
 };
 let updateToken='';let availableUpdate='';let updating=false;
-function updateInfo(ok, text){const b=$('updateMessage');b.style.display='block';b.className='message '+(ok?'ok':'error');b.textContent=text}
+let updateLogOffset=0, updateLogLoading=false, updatePollLoading=false, updateLastRun='';
+function updateInfo(ok,text){const b=$('updateMessage');b.style.display='block';b.className='message '+(ok?'ok':'error');b.textContent=text}
+function showUpdateProgress(status){
+ const progress=$('updateProgress');const track=$('updateTrack');
+ progress.hidden=false;track.className='update-track';
+ if(status==='success')track.classList.add('complete');
+ else if(status==='error')track.classList.add('failed');
+ track.setAttribute('aria-valuetext',status==='success'?'Zakończono':status==='error'?'Wystąpił błąd':'Trwa aktualizacja');
+ $('updateStage').textContent=status==='success'?'Aktualizacja zakończona':status==='error'?'Aktualizacja nie powiodła się':'Aktualizacja w toku';
+ $('updatePhase').textContent=status==='success'?'Gotowe':status==='error'?'Sprawdź log poniżej':'Postęp rzeczywisty w logu poniżej';
+ $('updateLogPanel').hidden=false;
+}
+function clearUpdateLog(){
+ updateLogOffset=0;$('updateLogText').textContent='Oczekiwanie na komunikaty YunoHost…';
+ $('updateLogPanel').hidden=false;$('updateLogPanel').open=true;
+}
+async function fetchUpdateLog(){
+ if(updateLogLoading)return;
+ updateLogLoading=true;
+ try{
+  const result=await api('/api/updates/log?offset='+updateLogOffset);
+  if(!result.success)return;
+  const box=$('updateLogText');
+  if(result.reset || result.skipped || (updateLogOffset===0 && result.text)){
+   box.textContent=result.skipped?'[Pominięto początek bardzo długiego logu]\n':'';
+  }
+  if(result.text){
+   const follow=box.scrollHeight-box.scrollTop-box.clientHeight<45;
+   if(box.textContent==='Oczekiwanie na komunikaty YunoHost…')box.textContent='';
+   box.textContent+=result.text;
+   // Keep browser memory bounded; the full log remains on disk inside the app.
+   if(box.textContent.length>280000)box.textContent='[Starsze komunikaty pominięte]\n'+box.textContent.slice(-240000);
+   if(follow)box.scrollTop=box.scrollHeight;
+  }
+  updateLogOffset=result.next_offset;
+ }catch(e){/* The app server can restart while it updates itself. */}
+ finally{updateLogLoading=false}
+}
 async function checkUpdates(){
- $('checkUpdate').disabled=true; $('startUpdate').disabled=true;
+ $('checkUpdate').disabled=true;$('startUpdate').disabled=true;
  updateInfo(true,'Sprawdzanie aktualizacji na GitHubie...');
  try{
-  const u=await api('/api/updates/check'); updateToken=u.csrf||'';availableUpdate='';
+  const u=await api('/api/updates/check');updateToken=u.csrf||'';availableUpdate='';
   $('versionInstalled').textContent=u.installed||'?';
   $('versionRemote').textContent=u.latest||'Brak danych';
   if(!u.success){updateInfo(false,u.message);return}
-  if(u.available){availableUpdate=u.latest; updateInfo(true,'Dostępna nowa wersja: '+u.latest);$('startUpdate').disabled=updating}
+  if(u.available){availableUpdate=u.latest;updateInfo(true,'Dostępna nowa wersja: '+u.latest);$('startUpdate').disabled=updating}
   else updateInfo(true,'Aplikacja jest aktualna.');
-  if(u.state&&['launching','running'].includes(u.state.status)){updating=true;$('startUpdate').disabled=true;updateInfo(true,u.state.message)}
+  if(u.state&&['launching','running'].includes(u.state.status)){
+   updating=true;$('startUpdate').disabled=true;updateInfo(true,u.state.message);
+   showUpdateProgress(u.state.status);
+  }
  }catch(e){updateInfo(false,'Nie udało się sprawdzić aktualizacji: '+e.message)}
  finally{$('checkUpdate').disabled=false}
 }
 $('checkUpdate').onclick=checkUpdates;
+$('copyUpdateLog').onclick=async()=>{
+ try{await navigator.clipboard.writeText($('updateLogText').textContent);$('copyUpdateLog').textContent='Skopiowano';
+ }catch(e){$('copyUpdateLog').textContent='Nie udało się skopiować'}
+};
 $('startUpdate').onclick=async()=>{
  if(!availableUpdate||!updateToken)return;
  if(!confirm('Zaktualizować YunoHost Backup Manager do '+availableUpdate+'? Panel uruchomi ponownie własną usługę.'))return;
- $('startUpdate').disabled=true; updating=true;
+ $('startUpdate').disabled=true;updating=true;
+ showUpdateProgress('launching');clearUpdateLog();
  updateInfo(true,'Uruchamianie aktualizacji...');
  try{
   const url=window.location.pathname.replace(/\/$/,'')+'/api/updates/start';
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Update-CSRF':updateToken},body:JSON.stringify({version:availableUpdate})});
   const x=await r.json();
-  if(!x.success){updating=false;updateInfo(false,x.message);$('startUpdate').disabled=false}
-  else updateInfo(true,x.message+' Trwa aktualizacja w YunoHost...');
- }catch(e){updateInfo(false,'Błąd uruchamiania: '+e.message);updating=false}
+  if(!x.success){updating=false;updateInfo(false,x.message);$('startUpdate').disabled=false;showUpdateProgress('error')}
+  else{updateInfo(true,'Aktualizacja uruchomiona. Komunikaty YunoHost pojawią się poniżej.');await fetchUpdateLog()}
+ }catch(e){updateInfo(false,'Błąd uruchamiania: '+e.message);updating=false;showUpdateProgress('error')}
 };
 async function pollUpdates(){
+ if(updatePollLoading)return;
+ updatePollLoading=true;
  try{
   const s=await api('/api/updates/status');if(!s.success)return;
-  if(['launching','running'].includes(s.state.status)){
-   updating=true; $('startUpdate').disabled=true;updateInfo(true,s.state.message);
-  }else if(['success','error'].includes(s.state.status)){
-   if(updating || s.state.status==='error')updateInfo(s.state.status==='success',s.state.message+(s.state.status==='success'?' Odśwież stronę, by zobaczyć nową wersję.':''));
-   updating=false;
+  const state=s.state, status=state.status;
+  const run=String(state.started_at||'')+':'+String(state.target||'');
+  if(run!==':'&&updateLastRun&&run!==updateLastRun){clearUpdateLog()}
+  if(run!==':')updateLastRun=run;
+  if(['launching','running'].includes(status)){
+   updating=true;$('startUpdate').disabled=true;updateInfo(true,state.message);
+   showUpdateProgress(status);await fetchUpdateLog();
+  }else if(['success','error'].includes(status)){
+   if(updating||status==='error')updateInfo(status==='success',state.message+(status==='success'?' Panel działa już w nowej wersji.':''));
+   updating=false;showUpdateProgress(status);await fetchUpdateLog();
   }
  }catch(e){if(updating)updateInfo(true,'Trwa aktualizacja — oczekiwanie na ponowne uruchomienie panelu...')}
+ finally{updatePollLoading=false}
 }
-checkUpdates();setInterval(pollUpdates,3500);
+checkUpdates();pollUpdates();setInterval(pollUpdates,1700);
 backupPoll().catch(e=>msg(false,e.message));
 setInterval(()=>backupPoll().catch(()=>{}),3000);
 refreshApps().catch(e=>msg(false,e.message));
