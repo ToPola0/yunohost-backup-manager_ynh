@@ -1,7 +1,8 @@
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, session
 from cryptography.fernet import Fernet
 from smb.SMBConnection import SMBConnection
 from smb import smb_structs
+from smb_transport import smb_endpoint
 import smbclient
 import sqlite3
 import threading
@@ -14,6 +15,9 @@ import subprocess
 import shutil
 import hashlib
 import time
+import hmac
+import secrets
+from updater import APP_VERSION, check_remote, read_state, write_state
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
@@ -32,6 +36,11 @@ try:
 except OSError:
     pass
 CIPHER = Fernet(KEY_FILE.read_bytes())
+# A separate signing derivation for the updater's CSRF-protected admin action.
+app.config.update(SECRET_KEY=hashlib.sha256(KEY_FILE.read_bytes() + b'/session-signing').digest(),
+                  SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict',
+                  SESSION_COOKIE_SECURE=True)
+UPDATE_LAUNCH_LOCK = threading.Lock()
 
 
 def db_connect():
@@ -83,14 +92,14 @@ def clean(data, require_share=True, require_id=False):
                 domain=domain, share=share, protocol=protocol, subdirectory=subdirectory)
 
 
-def connect_legacy(cfg, smb1):
+def connect_legacy(cfg, smb1, address, port):
     # PySMB przechowuje przełącznik dialektu globalnie; wywołania są serializowane.
     smb_structs.SUPPORT_SMB2 = not smb1
     conn = SMBConnection(cfg['username'], cfg['password'], 'YHBACKUP',
                          cfg['server'], domain=cfg['domain'], use_ntlm_v2=True,
                          is_direct_tcp=True)
     try:
-        if not conn.connect(cfg['server'], 445, timeout=8):
+        if not conn.connect(address, port, timeout=15):
             raise ConnectionError('Serwer odrzucił połączenie SMB.')
         return conn
     except Exception:
@@ -100,12 +109,13 @@ def connect_legacy(cfg, smb1):
 
 def legacy_discover(cfg, smb1):
     with SMB_LOCK:
-        conn = connect_legacy(cfg, smb1)
-        try:
-            return [s.name for s in conn.listShares(timeout=10)
-                    if not s.isSpecial and not s.isTemporary]
-        finally:
-            conn.close()
+        with smb_endpoint(cfg['server']) as endpoint:
+            conn = connect_legacy(cfg, smb1, endpoint.host, endpoint.port)
+            try:
+                return [s.name for s in conn.listShares(timeout=15)
+                        if not s.isSpecial and not s.isTemporary]
+            finally:
+                conn.close()
 
 
 def ensure_legacy_dirs(conn, cfg):
@@ -125,8 +135,8 @@ def ensure_legacy_dirs(conn, cfg):
             conn.listPath(cfg['share'], current + '/', timeout=10)
 
 
-def ensure_modern_dirs(cfg, cache):
-    root = '\\\\' + cfg['server'] + '\\' + cfg['share']
+def ensure_modern_dirs(cfg, cache, server):
+    root = '\\\\' + server + '\\' + cfg['share']
     for part in cfg['subdirectory'].split('/') if cfg['subdirectory'] else []:
         root += '\\' + part
         try:
@@ -139,50 +149,53 @@ def ensure_modern_dirs(cfg, cache):
 
 def legacy_test(cfg):
     with SMB_LOCK:
-        conn = connect_legacy(cfg, True)
-        name = 'yhbackup_test_' + uuid.uuid4().hex + '.tmp'
-        folder = '/' + cfg['subdirectory'].strip('/') if cfg['subdirectory'] else ''
-        test_path = folder + '/' + name
-        try:
-            ensure_legacy_dirs(conn, cfg)
-            conn.listPath(cfg['share'], folder + '/' if folder else '/', timeout=10)
-            conn.storeFile(cfg['share'], test_path,
-                           io.BytesIO(b'YunoHost Backup Manager test'), timeout=10)
+        with smb_endpoint(cfg['server']) as endpoint:
+            conn = connect_legacy(cfg, True, endpoint.host, endpoint.port)
+            name = 'yhbackup_test_' + uuid.uuid4().hex + '.tmp'
+            folder = '/' + cfg['subdirectory'].strip('/') if cfg['subdirectory'] else ''
+            test_path = folder + '/' + name
             try:
-                conn.deleteFiles(cfg['share'], test_path, timeout=10)
-            except Exception as e:
-                raise RuntimeError(f'Plik zapisany, ale nieusunięty: {name}. {e}')
-            return 'SMB1'
-        finally:
-            conn.close()
+                ensure_legacy_dirs(conn, cfg)
+                conn.listPath(cfg['share'], folder + '/' if folder else '/', timeout=15)
+                conn.storeFile(cfg['share'], test_path,
+                               io.BytesIO(b'YunoHost Backup Manager test'), timeout=15)
+                try:
+                    conn.deleteFiles(cfg['share'], test_path, timeout=15)
+                except Exception as e:
+                    raise RuntimeError(f'Plik zapisany, ale nieusunięty: {name}. {e}')
+                return 'SMB1' + (' przez Tailscale' if endpoint.via_tailscale else '')
+            finally:
+                conn.close()
 
 
 def modern_test(cfg):
     cache = {}
     user = (cfg['domain'] + '\\' if cfg['domain'] else '') + cfg['username']
-    root = '\\\\' + cfg['server'] + '\\' + cfg['share']
-    if cfg['subdirectory']:
-        root += '\\' + cfg['subdirectory'].replace('/', '\\')
-    name = 'yhbackup_test_' + uuid.uuid4().hex + '.tmp'
-    path = root + '\\' + name
-    try:
-        smbclient.register_session(cfg['server'], username=user,
-                                   password=cfg['password'], connection_timeout=8,
-                                   connection_cache=cache)
-        ensure_modern_dirs(cfg, cache)
-        smbclient.listdir(root, connection_cache=cache)
-        with smbclient.open_file(path, mode='wb', connection_cache=cache) as f:
-            f.write(b'YunoHost Backup Manager test')
+    with smb_endpoint(cfg['server']) as endpoint:
+        server = endpoint.host
+        root = '\\\\' + server + '\\' + cfg['share']
+        if cfg['subdirectory']:
+            root += '\\' + cfg['subdirectory'].replace('/', '\\')
+        name = 'yhbackup_test_' + uuid.uuid4().hex + '.tmp'
+        path = root + '\\' + name
         try:
-            smbclient.remove(path, connection_cache=cache)
-        except Exception as e:
-            raise RuntimeError(f'Plik zapisany, ale nieusunięty: {name}. {e}')
-        return 'SMB2/3'
-    finally:
-        try:
-            smbclient.delete_session(cfg['server'], connection_cache=cache)
-        except Exception:
-            pass
+            smbclient.register_session(server, username=user,
+                                       password=cfg['password'], port=endpoint.port,
+                                       connection_timeout=15, connection_cache=cache)
+            ensure_modern_dirs(cfg, cache, server)
+            smbclient.listdir(root, connection_cache=cache)
+            with smbclient.open_file(path, mode='wb', connection_cache=cache) as f:
+                f.write(b'YunoHost Backup Manager test')
+            try:
+                smbclient.remove(path, connection_cache=cache)
+            except Exception as e:
+                raise RuntimeError(f'Plik zapisany, ale nieusunięty: {name}. {e}')
+            return 'SMB2/3' + (' przez Tailscale' if endpoint.via_tailscale else '')
+        finally:
+            try:
+                smbclient.delete_session(server, connection_cache=cache)
+            except Exception:
+                pass
 
 
 def try_protocol(cfg, smb1, modern):
@@ -349,48 +362,52 @@ def file_hash(path):
 
 def transfer_legacy(cfg, files):
     with SMB_LOCK:
-        conn = connect_legacy(cfg, True)
-        folder = '/' + cfg['subdirectory'] if cfg['subdirectory'] else ''
-        try:
-            ensure_legacy_dirs(conn, cfg)
-            for path in files:
-                target = folder + '/' + path.name
-                with path.open('rb') as f:
-                    conn.storeFile(cfg['share'], target, f, timeout=7200)
-                verifier = HashWriter()
-                conn.retrieveFile(cfg['share'], target, verifier, timeout=7200)
-                if verifier.count != path.stat().st_size or verifier.digest.hexdigest() != file_hash(path):
-                    raise RuntimeError('Błąd weryfikacji SMB: ' + path.name)
-        finally:
-            conn.close()
+        with smb_endpoint(cfg['server']) as endpoint:
+            conn = connect_legacy(cfg, True, endpoint.host, endpoint.port)
+            folder = '/' + cfg['subdirectory'] if cfg['subdirectory'] else ''
+            try:
+                ensure_legacy_dirs(conn, cfg)
+                for path in files:
+                    target = folder + '/' + path.name
+                    with path.open('rb') as f:
+                        conn.storeFile(cfg['share'], target, f, timeout=7200)
+                    verifier = HashWriter()
+                    conn.retrieveFile(cfg['share'], target, verifier, timeout=7200)
+                    if verifier.count != path.stat().st_size or verifier.digest.hexdigest() != file_hash(path):
+                        raise RuntimeError('Błąd weryfikacji SMB: ' + path.name)
+            finally:
+                conn.close()
 
 
 def transfer_modern(cfg, files):
     cache = {}
     user = (cfg['domain'] + '\\' if cfg['domain'] else '') + cfg['username']
-    root = '\\\\' + cfg['server'] + '\\' + cfg['share']
-    if cfg['subdirectory']:
-        root += '\\' + cfg['subdirectory'].replace('/', '\\')
-    try:
-        smbclient.register_session(cfg['server'], username=user,
-                                   password=cfg['password'], connection_timeout=15,
-                                   connection_cache=cache)
-        ensure_modern_dirs(cfg, cache)
-        for path in files:
-            target = root + '\\\\' + path.name
-            with path.open('rb') as source, smbclient.open_file(target, 'wb', connection_cache=cache) as dest:
-                shutil.copyfileobj(source, dest, 1024 * 1024)
-            verifier = HashWriter()
-            with smbclient.open_file(target, 'rb', connection_cache=cache) as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b''):
-                    verifier.write(chunk)
-            if verifier.count != path.stat().st_size or verifier.digest.hexdigest() != file_hash(path):
-                raise RuntimeError('Błąd weryfikacji SMB: ' + path.name)
-    finally:
+    with smb_endpoint(cfg['server']) as endpoint:
+        server = endpoint.host
+        root = '\\\\' + server + '\\' + cfg['share']
+        if cfg['subdirectory']:
+            root += '\\' + cfg['subdirectory'].replace('/', '\\')
         try:
-            smbclient.delete_session(cfg['server'], connection_cache=cache)
-        except Exception:
-            pass
+            smbclient.register_session(server, username=user,
+                                       password=cfg['password'], port=endpoint.port,
+                                       connection_timeout=15, connection_cache=cache)
+            ensure_modern_dirs(cfg, cache, server)
+            for path in files:
+                target = root + '\\' + path.name
+                with path.open('rb') as source, smbclient.open_file(target, 'wb', connection_cache=cache) as dest:
+                    shutil.copyfileobj(source, dest, 1024 * 1024)
+                verifier = HashWriter()
+                with smbclient.open_file(target, 'rb', connection_cache=cache) as source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                        verifier.write(chunk)
+                if verifier.count != path.stat().st_size or verifier.digest.hexdigest() != file_hash(path):
+                    raise RuntimeError('Błąd weryfikacji SMB: ' + path.name)
+        finally:
+            try:
+                smbclient.delete_session(server, connection_cache=cache)
+            except Exception:
+                pass
+
 
 def backup_worker(app_ids, storage_id):
     try:
@@ -399,7 +416,7 @@ def backup_worker(app_ids, storage_id):
         estimated = 0
         for app_id in app_ids:
             output = yn_command('backup', 'create', '--apps', app_id, '--dry-run', timeout=300)
-            match = re.search(r'(?m)^size:\\s*(\\d+)\\s*$', output)
+            match = re.search(r'(?m)^size:\s*(\d+)\s*$', output)
             if not match:
                 raise RuntimeError('Nie udało się ustalić rozmiaru kopii dla ' + app_id)
             estimated += int(match.group(1))
@@ -458,6 +475,8 @@ def backup_start():
         return jsonify(success=False, message='Nieprawidłowa lista aplikacji.'), 400
     if not isinstance(storage_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,49}', storage_id):
         return jsonify(success=False, message='Wybierz magazyn.'), 400
+    if read_state().get('status') in ('launching', 'running'):
+        return jsonify(success=False, message='Trwa aktualizacja aplikacji. Poczekaj na zakończenie.'), 409
     if not BACKUP_LOCK.acquire(blocking=False):
         return jsonify(success=False, message='Kopia już trwa.'), 409
     BACKUP_STATE.update(status='running', message='Rozpoczynanie...', details=[])
@@ -503,6 +522,77 @@ def import_apps():
     except (ValueError, TypeError) as exc:
         return jsonify(success=False, message=str(exc)), 400
 
+
+
+@app.get('/api/updates/check')
+def updates_check():
+    # Same-origin clients receive a short-lived signed-session CSRF token.
+    token = secrets.token_urlsafe(32)
+    session['update_csrf'] = token
+    response = {'installed': APP_VERSION, 'csrf': token, 'state': read_state()}
+    try:
+        response.update(check_remote())
+        response['success'] = True
+    except Exception as exc:
+        response.update(success=False, available=False, latest=None,
+                        message='Nie udało się sprawdzić GitHuba: %s' % exc)
+    return jsonify(response)
+
+
+@app.get('/api/updates/status')
+def updates_status():
+    return jsonify(success=True, installed=APP_VERSION, state=read_state())
+
+
+@app.post('/api/updates/start')
+def updates_start():
+    if not on_yunohost():
+        return jsonify(success=False, message='Aktualizacja jest dostępna wyłącznie na YunoHost.'), 400
+    csrf = request.headers.get('X-Update-CSRF', '')
+    expected_csrf = session.get('update_csrf', '')
+    if not csrf or not expected_csrf or not hmac.compare_digest(csrf, expected_csrf):
+        return jsonify(success=False, message='Nieprawidłowe potwierdzenie żądania. Odśwież panel.'), 403
+    if BACKUP_LOCK.locked():
+        return jsonify(success=False, message='Trwa tworzenie kopii. Poczekaj na zakończenie.'), 409
+    if not UPDATE_LAUNCH_LOCK.acquire(blocking=False):
+        return jsonify(success=False, message='Uruchamianie aktualizacji już trwa.'), 409
+    try:
+        current = read_state()
+        if current['status'] in ('launching', 'running'):
+            return jsonify(success=False, message='Aktualizacja już trwa.'), 409
+        version = check_remote()  # Repeat validation immediately before launching.
+        if not version['available']:
+            return jsonify(success=False, message='Masz już najnowszą wersję.'), 409
+        expected_version = (request.get_json(silent=True) or {}).get('version')
+        if not isinstance(expected_version, str) or expected_version != version['latest']:
+            return jsonify(success=False, message='Wersja na GitHubie zmieniła się. Sprawdź ponownie.'), 409
+        runner = str(ROOT / 'update_runner.py')
+        systemd_run = shutil.which('systemd-run')
+        if not systemd_run or not pathlib.Path(runner).is_file():
+            return jsonify(success=False, message='Brak uruchamiacza aktualizacji w pakiecie.'), 500
+        if BACKUP_LOCK.locked():
+            return jsonify(success=False, message='W międzyczasie rozpoczęła się kopia zapasowa.'), 409
+        write_state(status='launching', target=expected_version,
+                    started_at=int(time.time()), message='Uruchamianie aktualizacji YunoHost...')
+        unit = 'yunohost-backup-manager-upd-' + uuid.uuid4().hex[:12]
+        try:
+            result = subprocess.run(
+                [systemd_run, '--quiet', '--collect', '--unit=' + unit,
+                 '--property=Type=exec', '--', '/usr/bin/python3', runner,
+                 '--expected-version', expected_version],
+                capture_output=True, text=True, timeout=20, check=False)
+            if result.returncode:
+                raise RuntimeError((result.stderr or result.stdout or 'systemd-run nie uruchomił aktualizacji.')[-1200:])
+        except Exception as exc:
+            write_state(status='error', target=expected_version,
+                        finished_at=int(time.time()), message='Nie uruchomiono aktualizacji: %s' % exc)
+            return jsonify(success=False, message=str(exc)), 500
+        return jsonify(success=True, message='Aktualizacja uruchomiona.', target=expected_version)
+    except Exception as exc:
+        return jsonify(success=False, message='Nie można rozpocząć aktualizacji: %s' % exc), 500
+    finally:
+        UPDATE_LAUNCH_LOCK.release()
+
 HTML = r'''<!doctype html>
 <html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>YunoHost Backup Manager</title><style>
@@ -514,7 +604,13 @@ h2{margin:0 0 20px}label{display:block;font-weight:bold;margin:14px 0 6px}input,
 button{background:#315b92;color:white;border:0;border-radius:5px;padding:11px 17px;cursor:pointer;font:inherit}button.secondary{background:#53677e}button.danger{background:#a83232}button:disabled{opacity:.5;cursor:wait}
 .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.message{white-space:pre-wrap;margin-top:18px;padding:13px;border-radius:5px;display:none}.ok{background:#dff2e5;color:#176331}.error{background:#fbe5e5;color:#8a2525}
 textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border-radius:5px;font:13px monospace} .appitem{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #e4e8ef}.appitem input{width:auto}.appitem small{display:block;margin-top:3px}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:12px 8px;border-bottom:1px solid #e4e8ef}td button{padding:7px 10px;margin:2px}small{color:#657286}.tablewrap{overflow-x:auto}
-</style></head><body><header>YunoHost Backup Manager <small style="color:#cad5e5">0.5</small></header><main>
+</style></head><body><header>YunoHost Backup Manager <small style="color:#cad5e5">0.5~ynh7</small></header><main>
+<section class="panel" id="updatePanel"><h2>Aktualizacje aplikacji</h2>
+<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh7</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
+<div id="updateMessage" class="message" style="display:none"></div>
+<div class="actions"><button type="button" id="checkUpdate" class="secondary">Sprawdź aktualizacje</button><button type="button" id="startUpdate" disabled>Aktualizuj aplikację</button></div>
+<p><small>Aktualizacja korzysta z mechanizmu YunoHost. Podczas jej wykonywania panel może być chwilowo niedostępny. Zapisane magazyny i hasła pozostają w katalogu danych aplikacji.</small></p>
+</section>
 <section class="panel"><h2>Magazyny SMB/CIFS</h2><div class="tablewrap"><table><thead><tr><th>ID</th><th>Serwer</th><th>Udział</th><th>Protokół</th><th>Akcje</th></tr></thead><tbody id="rows"><tr><td colspan="5">Wczytywanie...</td></tr></tbody></table></div></section>
 <section class="panel"><h2 id="formTitle">Dodaj magazyn SMB/CIFS</h2><form id="form">
 <div class="grid"><div><label for="id">ID magazynu</label><input id="id" name="id" placeholder="np. nas-backup" required></div>
@@ -578,6 +674,48 @@ $('runBackup').onclick=async()=>{
  const r=await api('/api/backup/start','POST',{apps,storage});
  if(!r.success)alert(r.message);await backupPoll();
 };
+let updateToken='';let availableUpdate='';let updating=false;
+function updateInfo(ok, text){const b=$('updateMessage');b.style.display='block';b.className='message '+(ok?'ok':'error');b.textContent=text}
+async function checkUpdates(){
+ $('checkUpdate').disabled=true; $('startUpdate').disabled=true;
+ updateInfo(true,'Sprawdzanie aktualizacji na GitHubie...');
+ try{
+  const u=await api('/api/updates/check'); updateToken=u.csrf||'';availableUpdate='';
+  $('versionInstalled').textContent=u.installed||'?';
+  $('versionRemote').textContent=u.latest||'Brak danych';
+  if(!u.success){updateInfo(false,u.message);return}
+  if(u.available){availableUpdate=u.latest; updateInfo(true,'Dostępna nowa wersja: '+u.latest);$('startUpdate').disabled=updating}
+  else updateInfo(true,'Aplikacja jest aktualna.');
+  if(u.state&&['launching','running'].includes(u.state.status)){updating=true;$('startUpdate').disabled=true;updateInfo(true,u.state.message)}
+ }catch(e){updateInfo(false,'Nie udało się sprawdzić aktualizacji: '+e.message)}
+ finally{$('checkUpdate').disabled=false}
+}
+$('checkUpdate').onclick=checkUpdates;
+$('startUpdate').onclick=async()=>{
+ if(!availableUpdate||!updateToken)return;
+ if(!confirm('Zaktualizować YunoHost Backup Manager do '+availableUpdate+'? Panel uruchomi ponownie własną usługę.'))return;
+ $('startUpdate').disabled=true; updating=true;
+ updateInfo(true,'Uruchamianie aktualizacji...');
+ try{
+  const url=window.location.pathname.replace(/\/$/,'')+'/api/updates/start';
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Update-CSRF':updateToken},body:JSON.stringify({version:availableUpdate})});
+  const x=await r.json();
+  if(!x.success){updating=false;updateInfo(false,x.message);$('startUpdate').disabled=false}
+  else updateInfo(true,x.message+' Trwa aktualizacja w YunoHost...');
+ }catch(e){updateInfo(false,'Błąd uruchamiania: '+e.message);updating=false}
+};
+async function pollUpdates(){
+ try{
+  const s=await api('/api/updates/status');if(!s.success)return;
+  if(['launching','running'].includes(s.state.status)){
+   updating=true; $('startUpdate').disabled=true;updateInfo(true,s.state.message);
+  }else if(['success','error'].includes(s.state.status)){
+   if(updating || s.state.status==='error')updateInfo(s.state.status==='success',s.state.message+(s.state.status==='success'?' Odśwież stronę, by zobaczyć nową wersję.':''));
+   updating=false;
+  }
+ }catch(e){if(updating)updateInfo(true,'Trwa aktualizacja — oczekiwanie na ponowne uruchomienie panelu...')}
+}
+checkUpdates();setInterval(pollUpdates,3500);
 backupPoll().catch(e=>msg(false,e.message));
 setInterval(()=>backupPoll().catch(()=>{}),3000);
 refreshApps().catch(e=>msg(false,e.message));

@@ -1,26 +1,33 @@
-# YunoHost Backup Manager — 0.5~ynh5 (wersja testowa)
+# YunoHost Backup Manager — 0.5~ynh7 (wersja testowa)
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh5**
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh7**
 
-Natywny pakiet aplikacji YunoHost Backup Manager dla YunoHost 12.1, instalowany z repozytorium GitHub poprzez panel YunoHost.
+Natywna aplikacja YunoHost 12.1, wykonująca i weryfikująca kopie na udziałach SMB1/SMB2/SMB3.
 
-## Zmiany w tej wersji (0.5~ynh5)
+## Nowości w wersji 0.5~ynh7
 
-- Poprawiono skrypty instalacji, aktualizacji, usuwania i przywracania: zastąpiono wywołania `ynh_add_nginx_config` / `ynh_add_systemd_config` funkcjami `ynh_config_add_nginx` / `ynh_config_add_systemd` oraz odpowiednikami do usuwania.
-- Zachowano instalację w podkatalogu istniejącej domeny, np. `/backup-manager` (wprowadzoną w 0.5~ynh4).
-- Port usługi: tylko lokalne `127.0.0.1:5051`.
+- Panel **Aktualizacje aplikacji** pokazuje wersję zainstalowaną i sprawdza wersję w repozytorium GitHub (`main/manifest.toml`).
+- Przycisk **Sprawdź aktualizacje**, komunikat o nowej wersji i przycisk **Aktualizuj aplikację** z potwierdzeniem.
+- Aktualizacja uruchamia natywne `yunohost app upgrade` z repozytorium GitHub, bez potrzeby ponownego korzystania z PuTTY.
+- Aktualizator działa w odrębnym, *tymczasowym* zadaniu systemd wywoływanym przez aplikację, aby przetrwać restart usługi WWW podczas aktualizacji. Nie instaluje dodatkowego stałego serwisu i nie zmienia konfiguracji systemu.
+- Aktualizator zapisuje postęp i wynik w katalogu danych aplikacji, obsługuje błędy i zabezpiecza żądanie aktualizacji tokenem CSRF.
+- Nie wykonuje aktualizacji w trakcie tworzenia kopii zapasowej.
+- Zachowano wszystkie funkcje 0.5~ynh6, w tym obsługę SMB przez `tailscale nc` w ramach aplikacji.
 
-## Instalacja
+## Jednorazowa aktualizacja z wersji 0.5~ynh5
 
-W panelu YunoHost wybierz instalację aplikacji z niestandardowego repozytorium Git:
+1. Rozpakuj całe archiwum ZIP i zastąp pliki w gałęzi `main`: https://github.com/ToPola0/yunohost-backup-manager_ynh
+2. W PuTTY na YunoHost wykonaj:
 
-https://github.com/ToPola0/yunohost-backup-manager_ynh
+   `sudo yunohost app upgrade yunohost-backup-manager --url https://github.com/ToPola0/yunohost-backup-manager_ynh`
 
-Ustaw domenę, ścieżkę `/backup-manager` i dostęp wyłącznie dla grupy administratorów.
+3. Otwórz panel `https://strona.rpkj.ovh/backup-manager/` i znajdź sekcję **Aktualizacje aplikacji**.
 
-## Ważne
+**Kolejne aktualizacje będą dostępne z poziomu panelu** po publikacji nowej wersji w tym samym repozytorium.
 
-- Panel wykonuje operacje administracyjne YunoHost jako `root`; **nie udostępniaj go publicznie**.
-- Dane i zaszyfrowane poświadczenia SMB przechowywane są w katalogu danych zarządzanym przez YunoHost.
-- Nowa instalacja nie importuje automatycznie magazynów SMB z wcześniejszej instalacji ręcznej.
-- Pakiet sprawdzono pod względem składni, ale **nie potwierdzono jeszcze pomyślnej instalacji na działającym YunoHost**.
+## Uwagi
+
+- Dostęp do aplikacji i jej aktualizatora jest przeznaczony wyłącznie dla administratorów YunoHost.
+- Aktualizacja korzysta z istniejącego mechanizmu kopii bezpieczeństwa YunoHost i nie usuwa katalogu danych ani zaszyfrowanych haseł magazynów.
+- Żadnych zmian w konfiguracji Proxmox, kontenera, OMV, Tailscale ani sieci.
+- Automatyczna aktualizacja nie została jeszcze sprawdzona na docelowym serwerze; należy wykonać pierwszą próbę, gdy pojawi się następna wersja.
