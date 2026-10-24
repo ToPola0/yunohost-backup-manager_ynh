@@ -1,15 +1,26 @@
-# YunoHost Backup Manager — 0.5~ynh3 (wersja testowa)
+# YunoHost Backup Manager — 0.5~ynh5 (wersja testowa)
 
-Pakiet przeznaczony do instalacji przez YunoHost 12.1 z repozytorium Git.
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh5**
 
-Ważne: aplikacja wykonuje komendy YunoHost jako root. Nie wystawiaj jej publicznie.
-Dostęp do panelu ogranicz do administratorów YunoHost.
+Natywny pakiet aplikacji YunoHost Backup Manager dla YunoHost 12.1, instalowany z repozytorium GitHub poprzez panel YunoHost.
 
-Panel wymaga osobnej domeny lub wolnej domeny z URL /.
-Backend nasłuchuje na 127.0.0.1:5051, aby nie kolidować z ręczną wersją na 5050.
-Nowa instalacja tworzy nową bazę magazynów SMB; nie importuje danych z ręcznej instalacji.
-Dane trzymane są w katalogu data_dir zarządzanym przez YunoHost.
+## Zmiany w tej wersji (0.5~ynh5)
 
-Skrypty sprawdzono składniowo, nie przetestowano instalacji na żywym YunoHost.
+- Poprawiono skrypty instalacji, aktualizacji, usuwania i przywracania: zastąpiono wywołania `ynh_add_nginx_config` / `ynh_add_systemd_config` funkcjami `ynh_config_add_nginx` / `ynh_config_add_systemd` oraz odpowiednikami do usuwania.
+- Zachowano instalację w podkatalogu istniejącej domeny, np. `/backup-manager` (wprowadzoną w 0.5~ynh4).
+- Port usługi: tylko lokalne `127.0.0.1:5051`.
 
-Wersja ynh4: instalacja pod ścieżką /backup-manager na istniejącej domenie.
+## Instalacja
+
+W panelu YunoHost wybierz instalację aplikacji z niestandardowego repozytorium Git:
+
+https://github.com/ToPola0/yunohost-backup-manager_ynh
+
+Ustaw domenę, ścieżkę `/backup-manager` i dostęp wyłącznie dla grupy administratorów.
+
+## Ważne
+
+- Panel wykonuje operacje administracyjne YunoHost jako `root`; **nie udostępniaj go publicznie**.
+- Dane i zaszyfrowane poświadczenia SMB przechowywane są w katalogu danych zarządzanym przez YunoHost.
+- Nowa instalacja nie importuje automatycznie magazynów SMB z wcześniejszej instalacji ręcznej.
+- Pakiet sprawdzono pod względem składni, ale **nie potwierdzono jeszcze pomyślnej instalacji na działającym YunoHost**.
