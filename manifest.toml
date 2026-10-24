@@ -1,0 +1,34 @@
+packaging_format = 2
+id = "yunohost-backup-manager"
+name = "YunoHost Backup Manager"
+description.en = "Back up YunoHost applications to SMB shares"
+description.pl = "Kopie zapasowe aplikacji YunoHost na udziały SMB"
+version = "0.5~ynh1"
+maintainers = []
+
+[integration]
+yunohost = ">= 12.0"
+architectures = "all"
+multi_instance = false
+ldap = "not_relevant"
+sso = "not_relevant"
+disk = "100M"
+ram.build = "300M"
+ram.runtime = "100M"
+
+[install]
+    [install.domain]
+    type = "domain"
+    [install.init_main_permission]
+    type = "group"
+    default = "admins"
+
+[resources]
+    [resources.system_user]
+    [resources.install_dir]
+    dir = "/opt/yunohost-backup-manager"
+    [resources.permissions]
+        [resources.permissions.main]
+        url = "/"
+    [resources.apt]
+    packages = "python3-venv, python3-pip"
