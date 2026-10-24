@@ -2406,6 +2406,130 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 .chunk-state.upload,.chunk-state.check,.chunk-state.verify{color:#2a6497}
 .chunk-state.waiting{color:#74849a}
 @media(max-width:650px){.backup-chunk-top{align-items:flex-start;flex-direction:column}}
+/* 0.5~ynh25 — subtelny, zwarty interfejs. Bez zmian logiki. */
+:root{--primary:#356792;--line:#e5eaf0;--muted:#64748b}
+body{font-size:13px;line-height:1.45;background:#f5f7fa;color:#25374d}
+.app-shell{grid-template-columns:218px minmax(0,1fr)}
+.app-sidebar{padding:18px 11px 15px;background:linear-gradient(160deg,#1b304a,#14263d);box-shadow:none}
+.sidebar-brand{gap:10px;padding:2px 7px 15px;margin-bottom:15px}
+.sidebar-brand img{width:37px;height:37px;border-radius:9px}
+.brand-copy strong{font-size:13px;line-height:1.23;letter-spacing:0}
+.brand-copy small{margin-top:3px;font-size:10.5px}
+.sidebar-group-label{font-size:9px;letter-spacing:1.1px;font-weight:700;margin:5px 0 5px;padding:0 11px}
+.sidebar-nav{gap:3px}
+.sidebar-nav .sidebar-group-label:not(:first-child){margin-top:16px}
+.nav-item{min-height:35px;padding:7px 10px;gap:9px;border-radius:6px;font-size:12.5px;font-weight:550;line-height:1.25}
+.nav-item svg{width:16px;height:16px;opacity:.85}
+.nav-item.active{background:#294b6b;border-color:#ffffff15;box-shadow:inset 2px 0 0 #7ec0e9}
+.sidebar-bottom{padding-top:10px;gap:2px}
+.sidebar-bottom .sidebar-group-label{margin:0 0 5px}
+.sidebar-version{font-size:10px;margin:11px 10px 0}
+.workspace-topbar{min-height:48px;padding:9px clamp(20px,3vw,36px);font-size:12px}
+.crumb-divider{padding:0 7px}
+.version-pill{padding:4px 9px;font-size:10.5px;background:#f5f7fa;border-color:#e7ecf2;font-weight:500}
+.workspace-content{max-width:1140px;padding:23px clamp(20px,3vw,36px) 36px}
+.page-heading{margin-bottom:17px}
+.page-eyebrow{font-size:9px;letter-spacing:1.2px;font-weight:700}
+.page-heading h1{font-size:24px;line-height:1.25;margin:5px 0 5px;font-weight:650}
+.page-heading p{font-size:12.5px;line-height:1.5}
+.panel{padding:18px 20px;margin-bottom:13px;border:1px solid #e6ebf1;border-radius:9px;box-shadow:0 2px 9px #172d4708}
+.panel h2{font-size:16px;font-weight:650;line-height:1.3;margin:0 0 13px}
+h2{margin-bottom:13px}
+label{font-size:12px;margin:10px 0 4px;font-weight:650}
+input,select,textarea{border:1px solid #d3dce6;border-radius:5px;padding:7px 9px;font-size:12.5px;min-height:34px;background:#fff;color:#26374d}
+input:focus,select:focus,textarea:focus{outline:2px solid #b6d5ed;outline-offset:0;border-color:#8cb4d5}
+input[type=checkbox],input[type=radio]{min-height:0;accent-color:#366894}
+textarea{font-size:12px;min-height:86px;line-height:1.45}
+.grid{gap:0 14px}
+button{background:#356993;color:#fff;border:1px solid #356993;border-radius:5px;padding:7px 11px;min-height:32px;font:500 12.5px/1.25 Arial,sans-serif;box-shadow:none;transition:background .15s ease,border-color .15s ease;white-space:normal}
+button:hover:not(:disabled){background:#2a587f;border-color:#2a587f;filter:none}
+button.secondary{background:#f6f8fb;border-color:#d4dee9;color:#435972}
+button.secondary:hover:not(:disabled){background:#eaf0f6;border-color:#bdcbdb;filter:none}
+button.danger{background:#fff5f5;border-color:#f0caca;color:#a83e3e}
+button.danger:hover:not(:disabled){background:#fbe9e9;border-color:#e6b2b2;filter:none}
+button:disabled{opacity:.48;cursor:not-allowed}
+.actions{gap:7px;margin-top:13px;align-items:center}
+.message{padding:9px 11px;margin-top:11px;font-size:12px;border-radius:5px}
+small,.archive-help,.schedule-hint{font-size:11.5px;line-height:1.45;color:#6c7b8d}
+.appitem{gap:8px;padding:7px 0}
+.appitem small{margin-top:2px}
+th,td{padding:8px 9px;border-bottom:1px solid #e9eef4;font-size:12.5px}
+th{font-weight:650;color:#536881;background:#fbfcfe}
+td button{padding:5px 8px;margin:1px;min-height:28px;font-size:11.5px}
+.backup-toolbar{gap:9px;margin:2px 0 11px}
+.backup-toolbar label{margin-bottom:4px}
+.backup-toolbar .actions{margin:0 0 1px}
+.archive-table td,.schedule-table td{font-size:12px}
+.archive-table .archive-name,.archive-name button{font-weight:600}
+.archive-actions{margin-top:11px;gap:7px}
+.archive-actions .archive-selection{font-size:12px}
+.archive-help{margin-top:9px}
+.backup-create-panel{padding-top:13px;margin-top:13px}
+.schedule-form-grid{gap:0 14px}
+.schedule-apps{padding:6px 10px;border-radius:6px}
+.schedule-tag{font-size:11px;padding:3px 7px}
+.schedule-grid-actions{gap:4px}
+#updateProgress,#backupProgress,#importProgress,#restoreProgress{margin-top:12px}
+.update-progress-caption{font-size:12px;margin-bottom:6px;gap:8px}
+.update-track{height:6px}
+#updateLogPanel,#backupLogPanel,#importLogPanel,#restoreLogPanel{margin-top:10px;border-radius:6px}
+#updateLogPanel summary,#backupLogPanel summary,#importLogPanel summary,#restoreLogPanel summary{padding:8px 11px;font-size:12px;font-weight:600}
+#updateLogPanel pre,#backupLogPanel pre,#importLogPanel pre,#restoreLogPanel pre{padding:11px 12px;min-height:58px;max-height:300px;font-size:11px;line-height:1.45}
+#updateLogPanel .actions{padding:6px 9px}
+#updateLogPanel .actions button{font-size:11px;padding:5px 9px;min-height:27px}
+.backup-chunk-panel{margin-top:11px;border-radius:6px}
+.backup-chunk-top{padding:9px 11px 5px;font-size:12px;gap:9px}
+.backup-chunk-top span{font-size:11.5px}
+.backup-folder{padding:2px 11px 8px;font-size:11px}
+.backup-folder code{font-size:11px}
+.backup-chunk-table{font-size:11.5px}
+.backup-chunk-table th,.backup-chunk-table td{padding:6px 9px}
+.backup-chunk-table code{font-size:11px}
+.chunk-meter{gap:7px;min-width:116px}
+.chunk-meter-track{height:6px}
+.chunk-meter small,.chunk-state{font-size:11px}
+.report-dialog,.restore-dialog{padding:19px;border-radius:9px}
+.report-dialog h2,.restore-dialog h2{font-size:17px;margin-bottom:11px}
+.report-grid{font-size:12px;gap:7px 10px;margin:12px 0}
+.report-log{padding:11px;font-size:11px;line-height:1.5}
+.restore-dialog p{font-size:12.5px}
+.restore-app{padding:7px 2px}
+.restore-alert{font-size:12px;padding:9px}
+@media(max-width:900px){
+ .app-shell{grid-template-columns:196px minmax(0,1fr)}
+ .app-sidebar{padding:15px 8px}
+ .sidebar-brand{padding:3px 5px 12px}
+ .sidebar-brand img{width:34px;height:34px}
+ .nav-item{padding:7px 8px;gap:7px}
+ .workspace-content{padding:19px 18px 34px}
+ .panel{padding:16px}
+}
+@media(max-width:720px){
+ .app-shell{display:block}
+ .app-sidebar{position:static;height:auto;padding:11px 13px;overflow:visible}
+ .sidebar-brand{margin-bottom:8px;padding:0 2px 9px}
+ .sidebar-brand img{width:33px;height:33px}
+ .sidebar-nav{grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}
+ .sidebar-nav .sidebar-group-label{display:none}
+ .nav-item{min-height:38px;padding:8px 7px;font-size:12px;gap:6px}
+ .nav-item svg{height:15px;width:15px}
+ .nav-item.active{box-shadow:inset 0 -2px 0 #7ec0e9}
+ .sidebar-bottom{margin-top:6px;padding:0;border:0}
+ .sidebar-bottom .nav-item{min-height:36px}
+ .workspace-topbar{min-height:42px;padding:8px 13px}
+ .workspace-content{padding:18px 12px 28px}
+ .page-heading{margin-bottom:14px}
+ .page-heading h1{font-size:21px;margin:4px 0}
+ .panel{padding:14px 13px;margin-bottom:10px}
+ .panel h2{font-size:15px;margin-bottom:10px}
+ .grid,.schedule-form-grid{grid-template-columns:1fr}
+ input,select,textarea{font-size:16px;min-height:36px}
+ button{min-height:36px;font-size:12px}
+ .backup-toolbar .backup-storage-field{min-width:170px}
+ .backup-chunk-top{align-items:flex-start}
+ .report-dialog,.restore-dialog{padding:15px}
+}
+@media(prefers-reduced-motion:reduce){button{transition:none}}
 </style></head><body>
 <div class="app-shell">
 <aside class="app-sidebar" aria-label="Menu aplikacji">
