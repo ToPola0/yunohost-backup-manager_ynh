@@ -25,6 +25,11 @@ import datetime
 import fcntl
 from updater import APP_VERSION, check_remote, read_state, write_state, read_log_chunk, LOG_FILE
 from cron_schedule import CronSpec, next_occurrence
+from resumable_chunks import (SMBStore, CHUNK_SIZE, FORMAT, MAX_REPORT,
+    make_manifest, manifest_validate, synchronize_chunks, save_manifest,
+    read_manifest, upload_report, verified_report, manifest_bytes, catalog_chunked,
+    safe_remove_complete, small_info_from_chunks, download_file, join_rel,
+    validate_name, MAX_MANIFEST)
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
@@ -325,17 +330,93 @@ BACKUP_DIR = pathlib.Path('/home/yunohost.backup/archives')
 BACKUP_LOCK = threading.Lock()
 BACKUP_STATE_GUARD = threading.RLock()
 BACKUP_REPORT = None  # only one backup can run while BACKUP_LOCK is held
+TRANSFER_JOB_FILE = DATA / 'pending_transfer.json'
+TRANSFER_FILE_LOCK = threading.RLock()
+TRANSFER_RETRY_SECONDS = 5
+
+
+def atomic_transfer_state(data):
+    """Persist pending job without secrets or access to any non-app path."""
+    with TRANSFER_FILE_LOCK:
+        temp = TRANSFER_JOB_FILE.with_suffix('.' + uuid.uuid4().hex + '.tmp')
+        try:
+            with open(temp, 'x', encoding='utf-8') as out:
+                json.dump(data, out, ensure_ascii=False, indent=2)
+                out.write('\n')
+                out.flush()
+                os.fsync(out.fileno())
+            os.chmod(temp, 0o600)
+            os.replace(temp, TRANSFER_JOB_FILE)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+def pending_transfer():
+    with TRANSFER_FILE_LOCK:
+        if not TRANSFER_JOB_FILE.is_file():
+            return None
+        result = json.loads(TRANSFER_JOB_FILE.read_text(encoding='utf-8'))
+        if not isinstance(result, dict) or not archive_name_ok(result.get('name')):
+            raise ValueError('Nieprawidłowy zapis stanu kopii.')
+        return result
+
+
+def transfer_cancelled(name):
+    job = pending_transfer()
+    return not job or job.get('name') != name or bool(job.get('cancel_requested'))
+
+
+def open_chunk_store(cfg, dialect):
+    return SMBStore(cfg, dialect, smb_endpoint, connect_legacy, ensure_legacy_dirs, ensure_modern_dirs)
+
+
+def chunk_dialect(cfg):
+    if cfg['protocol'] == 'smb1':
+        return 'smb1'
+    if cfg['protocol'] == 'smb2':
+        return 'smb2'
+    try:
+        modern_test(cfg)
+        return 'smb2'
+    except Exception as exc:
+        # A network outage must not change the stored protocol setting.
+        backup_event('SMB2/3 niedostępny; próba SMB1: ' + str(exc)[:180], phase='retry')
+        legacy_test(cfg)
+        return 'smb1'
+
+
+def chunk_read(cfg, callback):
+    if cfg['protocol'] == 'smb1':
+        with SMB_LOCK:
+            with open_chunk_store(cfg, 'smb1') as store:
+                return callback(store)
+    if cfg['protocol'] == 'smb2':
+        with open_chunk_store(cfg, 'smb2') as store:
+            return callback(store)
+    try:
+        with open_chunk_store(cfg, 'smb2') as store:
+            return callback(store)
+    except Exception as first:
+        # Avoid silently treating invalid/corrupt SMB2 metadata as SMB1 fallback.
+        if isinstance(first, (ValueError, RuntimeError)):
+            raise
+        with SMB_LOCK:
+            with open_chunk_store(cfg, 'smb1') as store:
+                return callback(store)
+
 REPORT_MAX_SIZE = 1024 * 1024
 BACKUP_STATE = {'status': 'idle', 'phase': 'idle', 'percent': None,
                 'message': 'Brak uruchomionej kopii.', 'details': [],
-                'done_bytes': 0, 'total_bytes': 0, 'log': []}
+                'done_bytes': 0, 'total_bytes': 0, 'log': [],
+                'archive_folder': '', 'chunks': []}
 
 
 def backup_event(message, phase=None, status=None, percent=None, reset=False):
     """Report verified stages; never invent a percentage for YunoHost CLI work."""
     with BACKUP_STATE_GUARD:
         if reset:
-            BACKUP_STATE.update(log=[], done_bytes=0, total_bytes=0, details=[])
+            BACKUP_STATE.update(log=[], done_bytes=0, total_bytes=0, details=[],
+                                archive_folder='', chunks=[])
         BACKUP_STATE['message'] = message
         BACKUP_STATE['percent'] = percent
         if phase is not None:
@@ -631,96 +712,261 @@ def save_backup_report_local(report):
         temp_path.unlink(missing_ok=True)
 
 
+def transfer_resumable(job):
+    """Retry/reconnect until full read-back verification or operator cancellation."""
+    global BACKUP_REPORT
+    name, storage_id = job['name'], job['storage']
+    app_ids, app_names = job['apps'], job['app_names']
+    started_at = job['started_at']
+    files = {'tar': BACKUP_DIR / (name + '.tar'),
+             'info': BACKUP_DIR / (name + '.info.json')}
+    attempt = 0
+    with BACKUP_STATE_GUARD:
+        BACKUP_REPORT = {'events': list(job.get('initial_log', []))}
+    while True:
+        if transfer_cancelled(name):
+            with TRANSFER_FILE_LOCK:
+                TRANSFER_JOB_FILE.unlink(missing_ok=True)
+            backup_event('Operator anulował przesyłanie. Pliki lokalne pozostawiono do ręcznej kontroli.',
+                         phase='cancelled', status='cancelled')
+            return
+        try:
+            cfg = cfg_from_storage(storage_id)
+            for role, path in files.items():
+                if not path.is_file() or not path.stat().st_size:
+                    raise RuntimeError('Brakuje lokalnego pliku kopii: ' + path.name)
+            manifest = make_manifest(name, files, app_ids, app_names, storage_id, started_at)
+            total = 2 * sum(p.stat().st_size for p in files.values())
+            # Every .part, both for the TAR and for the YunoHost metadata, lives
+            # directly inside ONE SMB folder named after this backup. The panel
+            # lists these exact remote filenames and never creates subfolders per part.
+            rows = []
+            for role in ('tar', 'info'):
+                for number, part in enumerate(manifest['files'][role]['chunks']):
+                    rows.append({'role': role, 'number': number, 'name': part['name'],
+                                 'bytes': part['bytes'], 'stage_bytes': 0,
+                                 'status': 'waiting', 'percent': 0})
+            by_chunk = {(row['role'], row['number']): row for row in rows}
+            with BACKUP_STATE_GUARD:
+                BACKUP_STATE.update(total_bytes=total, done_bytes=0, percent=0,
+                                    archive_folder=name, chunks=rows)
+            backup_event('Porównuję części lokalne ze zdalnymi, SHA256 każdej części; '
+                         'brakujące lub błędne zostaną nadpisane.',
+                         phase='transfer', status='running', percent=0)
+            dialect = chunk_dialect(cfg)
+            done = [0]
+            partial = [0]
+
+            def live_progress(role, n, stage, amount):
+                with BACKUP_STATE_GUARD:
+                    row = by_chunk[(role, n)]
+                    # A failed SHA256 check is followed by a new upload of the
+                    # very same part, not a second directory or a duplicate part.
+                    if stage == 'reset':
+                        partial[0] = 0
+                        row['stage_bytes'] = 0
+                        row['status'] = 'upload'
+                        row['percent'] = 0
+                    else:
+                        if row['status'] != stage:
+                            row['status'] = stage
+                            row['stage_bytes'] = 0
+                            row['percent'] = 0
+                        row['stage_bytes'] = min(row['bytes'], row['stage_bytes'] + amount)
+                        row['percent'] = min(100, int(row['stage_bytes'] * 100 / max(row['bytes'], 1)))
+                        partial[0] += amount * (2 if stage == 'check' else 1)
+                    BACKUP_STATE['done_bytes'] = min(total, done[0] + partial[0])
+                    BACKUP_STATE['percent'] = min(100, int(100 * BACKUP_STATE['done_bytes'] / max(total, 1)))
+
+            def verified(role, n, count, nbytes, outcome):
+                done[0] += 2 * nbytes
+                partial[0] = 0
+                with BACKUP_STATE_GUARD:
+                    row = by_chunk[(role, n)]
+                    row['status'] = 'reused' if outcome == 'verified_existing' else 'verified'
+                    row['stage_bytes'] = nbytes
+                    row['percent'] = 100
+                    BACKUP_STATE['done_bytes'] = done[0]
+                    BACKUP_STATE['total_bytes'] = total
+                    BACKUP_STATE['percent'] = min(100, int(done[0] * 100 / max(total, 1)))
+                message = ('Już poprawna' if outcome == 'verified_existing' else 'Wysłana i zweryfikowana')
+                backup_event(f'{message} część {role} {n+1}/{count} (SHA256).',
+                             phase='transfer', status='running', percent=BACKUP_STATE['percent'])
+
+            def run(store):
+                store.ensure_directory(name)
+                prior = read_manifest(store, name)
+                # A previous completed marker is safe only if its contents are
+                # valid AND all chunks are checked against current local data.
+                if prior is not None:
+                    for role in ('tar', 'info'):
+                        if (prior['files'][role]['bytes'] != files[role].stat().st_size or
+                            prior['files'][role]['sha256'] != file_hash(files[role])):
+                            raise RuntimeError('Istnieje inna kopia o tej samej nazwie.')
+                    # Never expose a completed marker while revalidating remote chunks.
+                    store.remove(join_rel(name, 'complete.json'))
+                source_checksums = {role: file_hash(path) for role, path in files.items()}
+                save_manifest(store, name, manifest, finished=False)
+                summary = synchronize_chunks(store, name, files, manifest,
+                     on_verified=verified, cancelled=lambda: transfer_cancelled(name),
+                     on_progress=live_progress)
+                if transfer_cancelled(name):
+                    raise InterruptedError('Operator przerwał wykonywanie kopii.')
+                backup_event(f'Zweryfikowano wszystkie części. Wysłano: {summary["sent"]}; '
+                             f'poprawne z wcześniejszej próby: {summary["reused"]}.',
+                             phase='report', status='running', percent=100)
+                hashes = {}
+                for role, path in files.items():
+                    final_digest = file_hash(path)
+                    if final_digest != source_checksums[role]:
+                        raise IOError('Lokalny plik zmienił się podczas transferu: ' + path.name)
+                    hashes[path.name] = {'bytes': path.stat().st_size, 'sha256': final_digest,
+                                         'remote_readback': True}
+                for role in ('tar', 'info'):
+                    manifest['files'][role]['sha256'] = hashes[files[role].name]['sha256']
+                report = make_backup_report(name, storage_id, app_ids, app_names, hashes, started_at)
+                report['verification'] = ('Każda część archiwum została w całości odczytana z SMB '
+                                           'i porównana SHA256 oraz rozmiarem z plikiem lokalnym.')
+                report['chunk_size'] = CHUNK_SIZE
+                report['chunks'] = {role: len(manifest['files'][role]['chunks']) for role in ('tar', 'info')}
+                save_backup_report_local(report)
+                manifest['report_sha256'] = upload_report(store, name, report)
+                manifest['completed_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+                # Final marker is published only after verified report and parts.
+                save_manifest(store, name, manifest, finished=True)
+                try:
+                    store.remove(join_rel(name, 'pending.json'))
+                except Exception:
+                    pass
+                return report
+
+            if dialect == 'smb1':
+                with SMB_LOCK:
+                    with open_chunk_store(cfg, dialect) as store:
+                        report = run(store)
+            else:
+                with open_chunk_store(cfg, dialect) as store:
+                    report = run(store)
+            backup_event('Wszystkie części i raport są zweryfikowane. Usuwam lokalną kopię YunoHost…',
+                         phase='cleanup', status='running', percent=None)
+            yn_command('backup', 'delete', name, timeout=300)
+            with TRANSFER_FILE_LOCK:
+                TRANSFER_JOB_FILE.unlink(missing_ok=True)
+            with BACKUP_STATE_GUARD:
+                BACKUP_STATE['details'] = ['Aplikacje: ' + ', '.join(app_names),
+                    'Kopia: ' + name, f'Części: {report["chunks"]["tar"]} archiwum + {report["chunks"]["info"]} metadane']
+            backup_event('Kopia ' + name + ' ukończona: wszystkie części SHA256 zgodne, '
+                         'manifest opublikowany, lokalne pliki usunięte.',
+                         phase='complete', status='success', percent=100)
+            return
+        except InterruptedError:
+            continue  # handled by cancelled() at loop entrance
+        except Exception as exc:
+            attempt += 1
+            wait = min(60, TRANSFER_RETRY_SECONDS * (2 ** min(attempt - 1, 4)))
+            backup_event(f'Przesyłanie wstrzymane: {type(exc).__name__}: {str(exc)[:350]}. '
+                         f'Ponowna weryfikacja i próba za {wait} s; możesz anulować w panelu.',
+                         phase='retry', status='running', percent=BACKUP_STATE.get('percent'))
+            for _ in range(wait):
+                if transfer_cancelled(name):
+                    break
+                time.sleep(1)
+
+
 def backup_worker(app_ids, storage_id, app_names):
     global BACKUP_REPORT
-    started_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
     name = None
-    hashes = {}
     try:
+        if pending_transfer():
+            raise RuntimeError('Oczekuje niedokończone zadanie transferu; nie tworzę drugiego archiwum.')
         backup_event('Sprawdzanie wolnego miejsca i rozmiaru kopii…',
                      phase='prepare', status='running')
         estimated = 0
         for app_id in app_ids:
             backup_event('Szacowanie miejsca: ' + app_id, phase='prepare')
-            output = yn_command('backup', 'create', '--apps', app_id, '--dry-run', timeout=300)
+            output = yn_command('backup', 'create', '--apps', app_id, '--dry-run', timeout=7200)
             match = re.search(r'(?m)^size:\s*(\d+)\s*$', output)
             if not match:
                 raise RuntimeError('Nie udało się ustalić rozmiaru kopii dla ' + app_id)
             estimated += int(match.group(1))
-        free = shutil.disk_usage(BACKUP_DIR).free
-        if free < estimated + 1024 ** 3:
-            raise RuntimeError('Za mało wolnego miejsca na kopię lokalną.')
-        cfg = cfg_from_storage(storage_id)
+        if shutil.disk_usage(BACKUP_DIR).free < estimated + 1024**3:
+            raise RuntimeError('Za mało miejsca na lokalne archiwum YunoHost.')
+        cfg_from_storage(storage_id)
         name = backup_archive_name(app_ids, app_names)
-        with BACKUP_STATE_GUARD:
-            BACKUP_REPORT = {'events': list(BACKUP_STATE['log'])}
-        backup_event('YunoHost tworzy archiwum ' + name + ' (' + ', '.join(app_names) + ')',
-                     phase='create')
-        yn_command('backup', 'create', '--apps', *app_ids, '--name', name)
-        files = [BACKUP_DIR / (name + '.tar'), BACKUP_DIR / (name + '.info.json')]
+        started_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+        backup_event('YunoHost tworzy archiwum ' + name + ' (' + ', '.join(app_names) + ')', phase='create')
+        # No two-hour wall-clock limit for creating large YunoHost archives.
+        yn_command('backup', 'create', '--apps', *app_ids, '--name', name, timeout=86400)
+        files = [BACKUP_DIR / (name + ext) for ext in ('.tar', '.info.json')]
         if not all(f.is_file() and f.stat().st_size > 0 for f in files):
-            raise RuntimeError('Niekompletna kopia lokalna; pliki pozostają na dysku.')
-        meter = BackupMeter(files)
-        total_mib = sum(path.stat().st_size for path in files) / 1024**2
-        backup_event(f'Archiwum gotowe ({total_mib:.1f} MiB). Rozpoczynam wysyłanie i kontrolę SHA256.',
-                     phase='transfer', percent=0)
-        if cfg['protocol'] == 'smb1':
-            transfer_legacy(cfg, files, meter, hashes)
-        elif cfg['protocol'] == 'smb2':
-            transfer_modern(cfg, files, meter, hashes)
-        else:
-            try:
-                modern_test(cfg)
-            except Exception as exc:
-                backup_event('SMB2/3 niedostępny, sprawdzanie SMB1: ' + str(exc)[:200],
-                             phase='transfer', percent=0)
-                legacy_test(cfg)
-                transfer_legacy(cfg, files, meter, hashes)
-            else:
-                transfer_modern(cfg, files, meter, hashes)
-        if len(hashes) != len(files):
-            raise RuntimeError('Nie uzyskano wyników SHA256 wszystkich plików archiwum.')
-        backup_event('Kontrola SHA256 wszystkich plików zakończona sukcesem. Zapis raportu przy archiwum…',
-                     phase='report', percent=None)
-        report = make_backup_report(name, storage_id, app_ids, app_names, hashes, started_at)
-        save_backup_report_local(report)
-        upload_backup_report(cfg, name, report)
-        backup_event('Raport ' + name + '.report.json zapisany na SMB i zweryfikowany SHA256.',
-                     phase='report', percent=None)
-        backup_event('Raport jest na SMB. YunoHost usuwa lokalną kopię archiwum…',
-                     phase='cleanup', percent=None)
-        yn_command('backup', 'delete', name, timeout=120)
+            raise RuntimeError('Niekompletna kopia lokalna; pozostawiono ją bez usuwania.')
         with BACKUP_STATE_GUARD:
-            BACKUP_STATE['details'] = (['Aplikacje: ' + ', '.join(f'{n} ({i})' for n,i in zip(app_names,app_ids))] +
-                                       [f.name for f in files])
-        backup_event('Kopia ' + name + ' przesłana, zweryfikowana (SHA256), raport zapisany, pliki lokalne usunięte.',
-                     phase='complete', status='success', percent=100)
+            initial_log = list(BACKUP_STATE['log'])
+        job = {'format': 'ybm-transfer-v1', 'name': name, 'storage': storage_id,
+               'apps': app_ids, 'app_names': app_names, 'started_at': started_at,
+               'initial_log': initial_log, 'cancel_requested': False}
+        atomic_transfer_state(job)
+        transfer_resumable(job)
     except Exception as exc:
-        backup_event(str(exc) + ' Kopia lokalna, jeśli powstała, nie została celowo usunięta.',
-                     phase='error', status='error')
-        if name and BACKUP_REPORT is not None:
-            try:
-                with BACKUP_STATE_GUARD:
-                    events = list(BACKUP_REPORT['events'])
-                save_backup_report_local({'format': 'yunohost-backup-manager-report-v1',
-                    'archive': name, 'storage': storage_id, 'started_at': started_at,
-                    'status': 'error', 'events': events,
-                    'verification': 'Kopia nie zakończyła się pełnym sukcesem. Wyniki plików obejmują tylko ukończone kontrole.',
-                    'files': hashes, 'cleanup': 'Lokalna kopia nie została celowo usunięta.'})
-            except Exception:
-                app.logger.exception('Nie zapisano lokalnego raportu błędu')
+        backup_event('Błąd tworzenia kopii: ' + str(exc) + '. Lokalne archiwum, jeśli istnieje, pozostawiono.',
+                     phase='error', status='error', percent=None)
     finally:
         with BACKUP_STATE_GUARD:
             BACKUP_REPORT = None
         BACKUP_LOCK.release()
 
 
+def resume_pending_transfer():
+    """On app restart, resume only already-created local backups (never YH restore)."""
+    if not on_yunohost():
+        return
+    try:
+        job = pending_transfer()
+        if not job:
+            return
+        if job.get('cancel_requested'):
+            with TRANSFER_FILE_LOCK:
+                TRANSFER_JOB_FILE.unlink(missing_ok=True)
+            return
+        if not BACKUP_LOCK.acquire(blocking=False):
+            return
+        backup_event('Po ponownym uruchomieniu wtyczki wznowiono weryfikację części SMB.',
+                     phase='retry', status='running', reset=True)
+        try:
+            transfer_resumable(job)
+        finally:
+            BACKUP_LOCK.release()
+    except Exception as exc:
+        backup_event('Błąd wznowienia: ' + str(exc), phase='error', status='error')
+
+
+@app.post('/api/backup/cancel')
+def backup_cancel():
+    expected = session.get('backup_cancel_csrf', '')
+    given = request.headers.get('X-Backup-CSRF', '')
+    if not expected or not given or not hmac.compare_digest(expected, given):
+        return jsonify(success=False, message='Odśwież panel kopii przed anulowaniem.'), 403
+    try:
+        job = pending_transfer()
+        if not job:
+            return jsonify(success=False, message='Nie ma transferu do anulowania.'), 409
+        job['cancel_requested'] = True
+        atomic_transfer_state(job)
+        return jsonify(success=True, message='Zlecono zatrzymanie transferu. Lokalne archiwum pozostanie na dysku.')
+    except Exception as exc:
+        return jsonify(success=False, message=str(exc)[:300]), 400
+
+
 @app.get('/api/backup/status')
 def backup_status():
     with BACKUP_STATE_GUARD:
         snapshot = {**BACKUP_STATE, 'log': list(BACKUP_STATE['log']),
-                    'details': list(BACKUP_STATE['details'])}
-    return jsonify(success=True, available=on_yunohost(), **snapshot)
+                    'details': list(BACKUP_STATE['details']),
+                    'chunks': [dict(row) for row in BACKUP_STATE['chunks']]}
+    token = session.get('backup_cancel_csrf') or secrets.token_urlsafe(32)
+    session['backup_cancel_csrf'] = token
+    return jsonify(success=True, available=on_yunohost(), cancel_csrf=token,
+                   can_cancel=TRANSFER_JOB_FILE.is_file(), **snapshot)
 
 
 @app.post('/api/backup/start')
@@ -740,6 +986,8 @@ def backup_start():
         return jsonify(success=False, message='Wybierz magazyn.'), 400
     if read_state().get('status') in ('launching', 'running'):
         return jsonify(success=False, message='Trwa aktualizacja aplikacji. Poczekaj na zakończenie.'), 409
+    if pending_transfer():
+        return jsonify(success=False, message='Poprzednia kopia jest nadal przesyłana lub oczekuje na wznowienie.'), 409
     if not BACKUP_LOCK.acquire(blocking=False):
         return jsonify(success=False, message='Trwa już tworzenie lub przywracanie kopii.'), 409
     backup_event('Rozpoczynanie kopii…', phase='prepare', status='running', reset=True)
@@ -881,7 +1129,7 @@ def scheduler_tick(now=None):
                                      (slot, now.strftime('%d.%m.%Y %H:%M'), 'Przygotowanie…', item['id'], slot))
             if not claimed.rowcount:
                 continue
-            if read_state().get('status') in ('launching','running') or not BACKUP_LOCK.acquire(blocking=False):
+            if pending_transfer() or read_state().get('status') in ('launching','running') or not BACKUP_LOCK.acquire(blocking=False):
                 schedule_result(item['id'], 'Pominięto termin: trwa inna kopia, przywracanie lub aktualizacja.')
                 continue
             try:
@@ -925,7 +1173,7 @@ threading.Thread(target=scheduler_loop, name='ybm-cron', daemon=True).start()
 # Archiwum -> wybór kopii -> przywracanie: w tym samym panelu co tworzenie.
 # Wykorzystuje wyłącznie istniejące połączenia SMB wtyczki i interfejs CLI YunoHost.
 RESTORE_STATE_GUARD = threading.RLock()
-RESTORE_STATE = {'status': 'idle', 'phase': 'idle', 'percent': None,
+RESTORE_STATE = {'status': 'idle', 'phase': 'idle', 'percent': None, 'cancel_requested': False,
                  'message': 'Nie uruchomiono przywracania.', 'done_bytes': 0,
                  'total_bytes': 0, 'log': []}
 ARCHIVE_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,179}\Z')
@@ -935,7 +1183,7 @@ RESTORE_METADATA_MAX = 2 * 1024 * 1024
 def restore_event(message, phase=None, status=None, percent=None, reset=False):
     with RESTORE_STATE_GUARD:
         if reset:
-            RESTORE_STATE.update(log=[], done_bytes=0, total_bytes=0)
+            RESTORE_STATE.update(log=[], done_bytes=0, total_bytes=0, cancel_requested=False)
         RESTORE_STATE['message'] = str(message)
         RESTORE_STATE['percent'] = percent
         if phase is not None:
@@ -1067,7 +1315,11 @@ def remote_archive_catalog(cfg, only=None):
                 except Exception:
                     pass
 
-    return try_protocol(cfg, legacy, modern)
+    flat = try_protocol(cfg, legacy, modern)
+    for entry in flat:
+        entry['format'] = 'legacy'
+    chunked = chunk_read(cfg, lambda store: catalog_chunked(store, parse_archive_metadata, only))
+    return sorted(flat + chunked, key=lambda x: x['name'], reverse=True)
 
 
 class RestoreWriter:
@@ -1172,6 +1424,79 @@ def remote_restore_download(cfg, name, tar_bytes, info_bytes, destination):
     try_protocol(cfg, legacy_attempt, modern_attempt)
 
 
+def remote_restore_chunked(cfg, name, staging):
+    """Resume verified chunks in place when a connection drops during restore."""
+    attempt = 0
+    totals_initialized = False
+    while True:
+        if RESTORE_STATE.get('cancel_requested'):
+            raise InterruptedError('Operator anulował pobieranie archiwum.')
+        try:
+            def run(store):
+                manifest = read_manifest(store, name)
+                if manifest is None:
+                    raise ValueError('Archiwum nie ma kompletnego manifestu — przywracanie zabronione.')
+                verified_report(store, name, manifest)
+                total = sum(x['bytes'] for x in manifest['files'].values())
+                with RESTORE_STATE_GUARD:
+                    RESTORE_STATE['total_bytes'] = total
+                    RESTORE_STATE['done_bytes'] = 0
+                    RESTORE_STATE['percent'] = 0
+                completed = [0]
+                def progress(amount):
+                    completed[0] += amount
+                    with RESTORE_STATE_GUARD:
+                        RESTORE_STATE['done_bytes'] = completed[0]
+                        RESTORE_STATE['percent'] = int(100 * completed[0] / max(total, 1))
+                for role in ('tar', 'info'):
+                    target = staging / (name + ('.tar' if role == 'tar' else '.info.json') + '.part')
+                    restore_event('Pobieranie i weryfikacja fragmentów: ' + role, phase='download',
+                                  status='running', percent=RESTORE_STATE['percent'])
+                    download_file(store, name, role, manifest['files'][role], target,
+                                  progress=progress, cancelled=lambda: RESTORE_STATE.get('cancel_requested'))
+                return manifest
+            if cfg['protocol'] == 'smb1':
+                with SMB_LOCK:
+                    with open_chunk_store(cfg, 'smb1') as store:
+                        return run(store)
+            if cfg['protocol'] == 'smb2':
+                with open_chunk_store(cfg, 'smb2') as store:
+                    return run(store)
+            try:
+                with open_chunk_store(cfg, 'smb2') as store:
+                    return run(store)
+            except (OSError, ConnectionError, TimeoutError):
+                with SMB_LOCK:
+                    with open_chunk_store(cfg, 'smb1') as store:
+                        return run(store)
+        except InterruptedError:
+            raise
+        except (ValueError, json.JSONDecodeError):
+            raise
+        except Exception as exc:
+            attempt += 1
+            wait = min(60, 5 * 2**min(attempt-1,4))
+            restore_event('SMB niedostępny lub uszkodzony fragment: ' + str(exc)[:180] +
+                          f'. Sprawdzę ponownie za {wait} s.', phase='download', status='running')
+            for _ in range(wait):
+                if RESTORE_STATE.get('cancel_requested'):
+                    raise InterruptedError('Operator anulował pobieranie archiwum.')
+                time.sleep(1)
+
+
+@app.post('/api/restore/cancel')
+def restore_cancel():
+    expected = session.get('restore_cancel_csrf', '')
+    given = request.headers.get('X-Restore-Cancel-CSRF', '')
+    if not expected or not given or not hmac.compare_digest(expected, given):
+        return jsonify(success=False, message='Odśwież stronę przed anulowaniem.'), 403
+    with RESTORE_STATE_GUARD:
+        if RESTORE_STATE['status'] != 'running' or RESTORE_STATE['phase'] == 'restore':
+            return jsonify(success=False, message='Nie można przerwać uruchomionego przywracania YunoHost.'), 409
+        RESTORE_STATE['cancel_requested'] = True
+    return jsonify(success=True, message='Zlecono anulowanie pobierania.')
+
+
 def run_restore_yunohost(name, apps):
     """Stream actual CLI output; never report success before a zero exit status."""
     import queue
@@ -1189,7 +1514,7 @@ def run_restore_yunohost(name, apps):
 
     reader_thread = threading.Thread(target=reader, daemon=True)
     reader_thread.start()
-    deadline = time.monotonic() + 7200
+    deadline = time.monotonic() + 86400
     finished = False
     while not finished:
         if time.monotonic() > deadline:
@@ -1199,7 +1524,7 @@ def run_restore_yunohost(name, apps):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-            raise RuntimeError('Przywracanie YunoHost przekroczyło limit 2 godzin.')
+            raise RuntimeError('Przywracanie YunoHost przekroczyło limit 24 godzin.')
         try:
             item = lines.get(timeout=1)
         except queue.Empty:
@@ -1213,7 +1538,7 @@ def run_restore_yunohost(name, apps):
         raise RuntimeError('YunoHost zakończył przywracanie błędem (kod %s). Zobacz log.' % rc)
 
 
-def restore_worker(storage_id, name, apps, size, info_size):
+def restore_worker(storage_id, name, apps, size, info_size, archive_format='legacy'):
     created = []
     staging = None
     success = False
@@ -1230,7 +1555,10 @@ def restore_worker(storage_id, name, apps, size, info_size):
         restore_event('Pobieranie archiwum SMB; nie zmieniamy pliku na magazynie.',
                       phase='download', percent=0)
         staging = pathlib.Path(tempfile.mkdtemp(prefix='.ybm-restore-', dir=BACKUP_DIR))
-        remote_restore_download(cfg, name, size, info_size, staging)
+        if archive_format == 'chunked':
+            remote_restore_chunked(cfg, name, staging)
+        else:
+            remote_restore_download(cfg, name, size, info_size, staging)
         for ext in ('.tar', '.info.json'):
             part = staging / (name + ext + '.part')
             target = BACKUP_DIR / (name + ext)
@@ -1296,7 +1624,7 @@ def parse_backup_report(raw, name):
             not isinstance(item.get('name'), str) or len(item['id']) > 100 or len(item['name']) > 200
             for item in applications):
         raise ValueError('Nieprawidłowa lista aplikacji w raporcie.')
-    return {'archive': name, 'status': report['status'], 'started_at': str(report.get('started_at', ''))[:50],
+    return {'archive': name, 'status': report['status'], 'chunks': report.get('chunks', {}), 'started_at': str(report.get('started_at', ''))[:50],
             'verified_at': str(report.get('verified_at', ''))[:50], 'storage': str(report.get('storage', ''))[:50],
             'verification': str(report.get('verification', ''))[:400], 'applications': applications,
             'files': normalized, 'events': events, 'cleanup': str(report.get('cleanup', ''))[:400]}
@@ -1347,6 +1675,15 @@ def remote_backup_report(cfg, name):
                 except Exception:
                     pass
 
+    def check_chunk_report(store):
+        entry = store.listing().get(name)
+        return read_manifest(store, name) if entry and entry.directory else None
+    chunked_exists = chunk_read(cfg, check_chunk_report)
+    if chunked_exists is not None:
+        def get_chunk_report(store):
+            raw = verified_report(store, name, chunked_exists)
+            return parse_backup_report(raw, name)
+        return chunk_read(cfg, get_chunk_report)
     return try_protocol(cfg, legacy, modern)
 
 
@@ -1442,13 +1779,21 @@ def backup_delete():
         return jsonify(success=False, message='Potwierdź usunięcie słowem USUŃ.'), 400
     if read_state().get('status') in ('launching', 'running'):
         return jsonify(success=False, message='Trwa aktualizacja aplikacji.'), 409
+    if pending_transfer():
+        return jsonify(success=False, message='Niedokończona kopia jest w trakcie przesyłania lub oczekuje na połączenie.'), 409
     if not BACKUP_LOCK.acquire(blocking=False):
         return jsonify(success=False, message='Trwa tworzenie lub przywracanie kopii.'), 409
     try:
         # A one-time token prevents repeating a destructive operation.
         session.pop('delete_csrf', None)
         cfg = cfg_from_storage(storage_id)
-        deleted = delete_remote_archive(cfg, name)
+        records = remote_archive_catalog(cfg, name)
+        if len(records) != 1:
+            raise ValueError('Nie znaleziono jednoznacznego kompletnego archiwum.')
+        if records[0].get('format') == 'chunked':
+            deleted = chunk_read(cfg, lambda store: safe_remove_complete(store, name))
+        else:
+            deleted = delete_remote_archive(cfg, name)
         return jsonify(success=True, message='Usunięto kopię z magazynu SMB: ' + name,
                        deleted=deleted)
     except Exception as exc:
@@ -1497,7 +1842,9 @@ def restore_archives():
 def restore_status():
     with RESTORE_STATE_GUARD:
         snapshot = {**RESTORE_STATE, 'log': list(RESTORE_STATE['log'])}
-    return jsonify(success=True, **snapshot)
+    token = session.get('restore_cancel_csrf') or secrets.token_urlsafe(32)
+    session['restore_cancel_csrf'] = token
+    return jsonify(success=True, cancel_csrf=token, **snapshot)
 
 
 @app.post('/api/restore/start')
@@ -1517,6 +1864,8 @@ def restore_start():
         return jsonify(success=False, message='Nieprawidłowa lista aplikacji lub archiwum.'), 400
     if read_state().get('status') in ('launching', 'running'):
         return jsonify(success=False, message='Trwa aktualizacja aplikacji.'), 409
+    if pending_transfer():
+        return jsonify(success=False, message='Niedokończona kopia jest w trakcie przesyłania lub oczekuje na połączenie.'), 409
     if not BACKUP_LOCK.acquire(blocking=False):
         return jsonify(success=False, message='Trwa inna operacja kopii lub przywracania.'), 409
     try:
@@ -1535,7 +1884,7 @@ def restore_start():
         session.pop('restore_csrf', None)
         restore_event('Rozpoczynam przywracanie: ' + name, phase='prepare', status='running', reset=True)
         threading.Thread(target=restore_worker,
-                         args=(storage_id, name, apps, archive['size'], archive['info_size']), daemon=True).start()
+                         args=(storage_id, name, apps, archive['size'], archive['info_size'], archive.get('format', 'legacy')), daemon=True).start()
         return jsonify(success=True, message='Rozpoczęto pobieranie i przywracanie kopii.')
     except Exception as exc:
         BACKUP_LOCK.release()
@@ -1623,7 +1972,7 @@ def updates_start():
     expected_csrf = session.get('update_csrf', '')
     if not csrf or not expected_csrf or not hmac.compare_digest(csrf, expected_csrf):
         return jsonify(success=False, message='Nieprawidłowe potwierdzenie żądania. Odśwież panel.'), 403
-    if BACKUP_LOCK.locked():
+    if BACKUP_LOCK.locked() or TRANSFER_JOB_FILE.exists():
         return jsonify(success=False, message='Trwa tworzenie lub przywracanie kopii. Poczekaj na zakończenie.'), 409
     if not UPDATE_LAUNCH_LOCK.acquire(blocking=False):
         return jsonify(success=False, message='Uruchamianie aktualizacji już trwa.'), 409
@@ -1644,7 +1993,7 @@ def updates_start():
         systemd_run = shutil.which('systemd-run')
         if not systemd_run or not pathlib.Path(runner).is_file():
             return jsonify(success=False, message='Brak uruchamiacza aktualizacji w pakiecie.'), 500
-        if BACKUP_LOCK.locked():
+        if BACKUP_LOCK.locked() or TRANSFER_JOB_FILE.exists():
             return jsonify(success=False, message='W międzyczasie rozpoczęła się kopia zapasowa.'), 409
         # Only the app's own last-update log is cleared for a fresh run.
         with open(LOG_FILE, 'wb'):
@@ -1728,6 +2077,9 @@ body{background:#f2f5f9;color:var(--text)}
 .sidebar-mark{background:#51b8a7;width:7px;height:7px;border-radius:50%;flex:none}
 .app-workspace{min-width:0}
 .workspace-topbar{min-height:68px;background:#fff;border-bottom:1px solid var(--line);padding:17px clamp(22px,4vw,56px);display:flex;align-items:center;justify-content:space-between;gap:12px;color:#637389;font-size:13px}
+.yunohost-home-link{color:#315f98;text-decoration:none;font-weight:700}
+.yunohost-home-link:hover{text-decoration:underline;text-underline-offset:3px;color:#174a80}
+.yunohost-home-link:focus-visible{outline:2px solid #80b7ee;outline-offset:3px;border-radius:2px}
 .crumb-divider{display:inline-block;padding:0 9px;color:#a0aabb}
 .version-pill{color:#3d5877;background:#f1f5fa;border:1px solid #e1e8f1;border-radius:99px;padding:7px 12px;white-space:nowrap;font-size:12px;font-weight:600}
 .workspace-content{max-width:1160px;margin:0 auto;padding:34px clamp(22px,4vw,52px) 54px;min-width:0}
@@ -1811,12 +2163,35 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 .schedule-tag.off{background:#eceff4;color:#57677b}
 .schedule-grid-actions{display:flex;gap:6px;flex-wrap:wrap}
 @media(max-width:720px){.schedule-form-grid{grid-template-columns:1fr}}
+
+/* Wersja 0.5~ynh21: rzeczywisty postęp każdej części w pojedynczym folderze SMB. */
+.backup-chunk-panel{margin-top:18px;border:1px solid #d8e2ec;border-radius:9px;overflow:hidden;background:#f8fbff}
+.backup-chunk-panel[hidden]{display:none}
+.backup-chunk-top{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 15px 8px;color:#243b59}
+.backup-chunk-top span{font-size:13px;font-weight:700;color:#315b92;white-space:nowrap}
+.backup-folder{padding:4px 15px 12px;font-size:12px;overflow-wrap:anywhere;color:#546b86}
+.backup-folder code{font-family:Consolas,monospace;color:#234e81;font-size:12px}
+.backup-chunk-scroll{max-height:380px;overflow:auto;background:white}
+.backup-chunk-table{min-width:500px;font-size:13px}
+.backup-chunk-table th{position:sticky;top:0;background:#edf3f9;color:#3b526c;z-index:1}
+.backup-chunk-table td,.backup-chunk-table th{padding:9px 12px}
+.backup-chunk-table code{font-size:12px;white-space:nowrap}
+.chunk-meter{display:flex;align-items:center;gap:10px;min-width:135px}
+.chunk-meter-track{height:8px;border-radius:20px;overflow:hidden;flex:1;background:#e4eaf1}
+.chunk-meter-fill{display:block;height:100%;width:0;background:#387cb6;border-radius:20px;transition:width .2s ease}
+.chunk-meter-fill.verified{background:#289666}
+.chunk-meter small{min-width:34px;text-align:right;font-size:12px}
+.chunk-state{font-weight:600;white-space:nowrap;font-size:12px}
+.chunk-state.verified,.chunk-state.reused{color:#197d51}
+.chunk-state.upload,.chunk-state.check,.chunk-state.verify{color:#2a6497}
+.chunk-state.waiting{color:#74849a}
+@media(max-width:650px){.backup-chunk-top{align-items:flex-start;flex-direction:column}}
 </style></head><body>
 <div class="app-shell">
 <aside class="app-sidebar" aria-label="Menu aplikacji">
   <div class="sidebar-brand">
     <img id="appLogo" alt="" width="48" height="48">
-    <div class="brand-copy"><strong>YunoHost<br>Backup Manager</strong><small>0.5~ynh17</small></div>
+    <div class="brand-copy"><strong>YunoHost<br>Backup Manager</strong><small>0.5~ynh19</small></div>
   </div>
   <div class="sidebar-group-label">ZARZĄDZANIE</div>
   <nav class="sidebar-nav" aria-label="Kategorie">
@@ -1828,7 +2203,7 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
   <div class="sidebar-bottom"><span class="sidebar-mark"></span> Panel kopii zapasowych</div>
 </aside>
 <div class="app-workspace">
-  <header class="workspace-topbar"><span>YunoHost <span class="crumb-divider">/</span> Backup Manager</span><span class="version-pill">v0.5~ynh17</span></header>
+  <header class="workspace-topbar"><nav aria-label="Ścieżka nawigacji"><a class="yunohost-home-link" href="/yunohost/admin/" title="Powrót do panelu administracyjnego YunoHost">YunoHost</a><span class="crumb-divider">/</span><span aria-current="page">Backup Manager</span></nav><span class="version-pill">v0.5~ynh19</span></header>
   <main class="workspace-content" id="mainContent">
     <div class="page-heading"><span class="page-eyebrow">PANEL ZARZĄDZANIA</span><h1 id="viewTitle">Magazyn</h1><p id="viewDescription">Zarządzaj magazynami SMB/CIFS i połączeniami sieciowymi.</p></div>
     <div class="category-view" id="view-magazyn" data-category="magazyn">
@@ -1873,12 +2248,20 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
 <div id="backupProgress" hidden>
   <div class="update-progress-caption"><strong id="backupStage">Przygotowywanie kopii</strong><span id="backupPhase">Trwa praca…</span></div>
   <div id="backupTrack" class="update-track" role="progressbar" aria-label="Postęp wykonywania kopii" aria-valuetext="Trwa praca"><span id="backupFill" class="update-progress-fill"></span></div>
-</div><details id="backupLogPanel" hidden open><summary>Podgląd tworzenia kopii (log)</summary><pre id="backupLogText" role="log" aria-label="Log tworzenia kopii">Oczekiwanie na uruchomienie…</pre></details>
+</div>
+<div id="backupChunkPanel" class="backup-chunk-panel" hidden>
+  <div class="backup-chunk-top"><strong>Fragmenty archiwum w jednym katalogu SMB</strong><span id="backupChunkCount">0 / 0</span></div>
+  <div class="backup-folder">Katalog: <code id="backupChunkFolder"></code></div>
+  <div class="tablewrap backup-chunk-scroll"><table class="backup-chunk-table"><thead><tr><th>Część</th><th>Rozmiar</th><th>Stan</th><th>Postęp części</th></tr></thead><tbody id="backupChunkRows"></tbody></table></div>
+</div>
+<details id="backupLogPanel" hidden open><summary>Podgląd tworzenia kopii (log)</summary><pre id="backupLogText" role="log" aria-label="Log tworzenia kopii">Oczekiwanie na uruchomienie…</pre></details>
+<div class="actions"><button type="button" id="cancelBackupTransfer" class="danger" hidden>Przerwij przesyłanie kopii</button></div>
 <div id="backupMessage" class="message"></div>
 <div id="restoreProgress" hidden>
   <div class="update-progress-caption"><strong id="restoreStage">Przywracanie kopii</strong><span id="restorePhase">Trwa praca…</span></div>
   <div id="restoreTrack" class="update-track" role="progressbar" aria-label="Postęp przywracania" aria-valuetext="Trwa przywracanie"><span id="restoreFill" class="update-progress-fill"></span></div>
 </div><details id="restoreLogPanel" hidden open><summary>Podgląd przywracania (log YunoHost)</summary><pre id="restoreLogText" role="log" aria-label="Log przywracania"></pre></details>
+<div class="actions"><button type="button" id="cancelRestoreTransfer" class="danger" hidden>Przerwij pobieranie kopii</button></div>
 <div id="restoreMessage" class="message"></div></section>
 <dialog class="report-dialog" id="reportDialog" aria-labelledby="reportDialogHeading">
 <h2 id="reportDialogHeading">Raport wykonania kopii</h2>
@@ -1919,7 +2302,7 @@ button:focus-visible{outline:2px solid #7ab9f3;outline-offset:2px}
     </div>
     <div class="category-view" id="view-aktualizacja" data-category="aktualizacja" hidden>
 <section class="panel" id="updatePanel"><h2>Aktualizacje aplikacji</h2>
-<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh17</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
+<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh19</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
 <div id="updateMessage" class="message" style="display:none"></div>
 <div class="actions"><button type="button" id="checkUpdate" class="secondary">Sprawdź aktualizacje</button><button type="button" id="startUpdate" disabled>Aktualizuj aplikację</button></div>
 <div id="updateProgress" hidden>
@@ -2017,7 +2400,7 @@ $('importApps').onclick=async()=>{
 };
 
 // Biblioteka archiwów i przywracanie w tym samym widoku (jak magazyn kopii w Proxmox).
-let archiveRecords=[], selectedArchive='', restoreToken='', deleteToken='', restoreRunning=false, backupWasRunning=false, deletingArchive=false;
+let archiveRecords=[], selectedArchive='', restoreToken='', deleteToken='', restoreRunning=false, backupWasRunning=false, deletingArchive=false, backupCancelToken='', restoreCancelToken='';
 let activeRestore=null, lastRestoreFinished='';
 function archiveNotice(ok,text){const box=$('archiveMessage');box.style.display='block';box.className='message '+(ok?'ok':'error');box.textContent=text}
 function readableSize(bytes){if(!Number.isFinite(bytes))return '—';return bytes>=1073741824?(bytes/1073741824).toFixed(2)+' GiB':(bytes/1048576).toFixed(1)+' MiB'}
@@ -2078,6 +2461,7 @@ async function openArchiveReport(name){
   reportField(values,'Rozpoczęto',r.started_at);reportField(values,'Zweryfikowano',r.verified_at);
   reportField(values,'Aplikacje',(r.applications||[]).map(x=>x.name+' ('+x.id+')').join(', '));
   reportField(values,'Sposób weryfikacji',r.verification);
+  if(r.chunks)reportField(values,'Liczba części',String(r.chunks.tar||0)+' archiwum, '+String(r.chunks.info||0)+' metadane');
   reportField(values,'Kopia lokalna',r.cleanup);
   body.append(values);
   const title=document.createElement('h3');title.textContent='Pliki i sumy SHA256';body.append(title);
@@ -2180,7 +2564,8 @@ $('confirmRestore').onclick=async()=>{
  }catch(e){archiveNotice(false,e.message);$('restoreDialog').close()}
 };
 async function restorePoll(){
- const s=await api('/api/restore/status');
+ const s=await api('/api/restore/status');restoreCancelToken=s.cancel_csrf||'';
+ $('cancelRestoreTransfer').hidden=!(s.status==='running' && s.phase==='download');
  const previousRestore=restoreRunning;restoreRunning=s.status==='running';
  const p=$('restoreProgress'),l=$('restoreLogPanel'),track=$('restoreTrack'),fill=$('restoreFill');
  if(s.status==='idle'){p.hidden=true;l.hidden=true;return;}
@@ -2203,30 +2588,55 @@ async function restorePoll(){
  if(previousRestore!==restoreRunning)showArchiveRows();
 }
 
+function renderBackupChunks(s){
+ const panel=$('backupChunkPanel'),items=Array.isArray(s.chunks)?s.chunks:[];
+ if(!items.length){panel.hidden=true;return;}
+ panel.hidden=false;
+ $('backupChunkFolder').textContent=s.archive_folder||'—';
+ const completed=items.filter(c=>c.status==='verified'||c.status==='reused').length;
+ $('backupChunkCount').textContent=completed+' / '+items.length+' zweryfikowanych';
+ const labels={waiting:'Oczekuje',check:'Sprawdzanie SHA256',upload:'Wysyłanie',verify:'Weryfikacja SHA256',
+               verified:'Wysłana i sprawdzona',reused:'Już poprawna — pominięta'};
+ const root=$('backupChunkRows');root.replaceChildren();
+ for(const item of items){
+  const tr=root.insertRow();
+  const file=tr.insertCell(),name=document.createElement('code');name.textContent=item.name;file.append(name);
+  tr.insertCell().textContent=readableSize(item.bytes);
+  const phase=tr.insertCell(),span=document.createElement('span');span.className='chunk-state '+item.status;
+  span.textContent=labels[item.status]||'Oczekuje';phase.append(span);
+  const meter=tr.insertCell(),line=document.createElement('div');line.className='chunk-meter';
+  const track=document.createElement('span');track.className='chunk-meter-track';
+  const fill=document.createElement('span');fill.className='chunk-meter-fill'+((item.status==='verified'||item.status==='reused')?' verified':'');
+  const value=Math.max(0,Math.min(100,Number(item.percent)||0));fill.style.width=value+'%';track.append(fill);
+  const text=document.createElement('small');text.textContent=value+'%';line.append(track,text);meter.append(line);
+ }
+}
 async function backupPoll(){
- const s=await api('/api/backup/status');const btn=$('runBackup');btn.disabled=!s.available||s.status==='running'||restoreRunning;
- const box=$('backupMessage');box.style.display=s.status==='idle'?'none':'block';box.className='message '+(s.status==='error'?'error':'ok');
+ const s=await api('/api/backup/status');
+ renderBackupChunks(s);backupCancelToken=s.cancel_csrf||'';
+ $('cancelBackupTransfer').hidden=!s.can_cancel;const btn=$('runBackup');btn.disabled=!s.available||s.status==='running'||restoreRunning;
+ const box=$('backupMessage');box.style.display=s.status==='idle'?'none':'block';box.className='message '+((s.status==='error'||s.status==='cancelled')?'error':'ok');
  box.textContent=s.available?s.message:'Tryb Windows: kopie będą dostępne po uruchomieniu aplikacji na YunoHost.';
  const progress=$('backupProgress'),logPanel=$('backupLogPanel'),track=$('backupTrack'),fill=$('backupFill');
  if(s.status==='idle'){progress.hidden=true;logPanel.hidden=true;return}
  const previousBackup=backupWasRunning;
- if(s.status==='running')backupWasRunning=true;else if(backupWasRunning && s.status==='success'){backupWasRunning=false;refreshArchives().catch(()=>{})}else if(s.status==='error')backupWasRunning=false;
+ if(s.status==='running')backupWasRunning=true;else if(backupWasRunning && s.status==='success'){backupWasRunning=false;refreshArchives().catch(()=>{})}else if(s.status==='error'||s.status==='cancelled')backupWasRunning=false;
  if(previousBackup!==backupWasRunning)showArchiveRows();
  progress.hidden=false;logPanel.hidden=false;track.className='update-track';fill.style.width='';
  const names={prepare:'Sprawdzanie miejsca',create:'Tworzenie archiwum YunoHost',
-              transfer:'Transfer i weryfikacja SMB',report:'Zapis raportu SHA256',cleanup:'Usuwanie kopii lokalnej',
+              transfer:'Transfer części SMB (SHA256)',retry:'Oczekiwanie na SMB — automatyczne wznowienie',cancelled:'Transfer anulowany',report:'Zapis raportu SHA256',cleanup:'Usuwanie kopii lokalnej',
               complete:'Kopia zakończona',error:'Błąd tworzenia kopii'};
  $('backupStage').textContent=names[s.phase]||'Tworzenie kopii';
  if(s.status==='success'){
   track.classList.add('complete');$('backupPhase').textContent='Gotowe';
   track.setAttribute('aria-valuetext','Kopia zweryfikowana i zakończona');
- }else if(s.status==='error'){
-  track.classList.add('failed');$('backupPhase').textContent='Zobacz log';
+ }else if(s.status==='error'||s.status==='cancelled'){
+  track.classList.add('failed');$('backupPhase').textContent=s.status==='cancelled'?'Anulowano':'Zobacz log';
   track.setAttribute('aria-valuetext','Nie udało się wykonać kopii');
- }else if(s.phase==='transfer' && typeof s.percent==='number'){
+ }else if((s.phase==='transfer'||s.phase==='retry') && typeof s.percent==='number'){
   track.classList.add('measured');fill.style.width=Math.min(100,Math.max(0,s.percent))+'%';
   const done=(s.done_bytes/1048576).toFixed(1),total=(s.total_bytes/1048576).toFixed(1);
-  $('backupPhase').textContent=s.percent+'% transmisji i weryfikacji ('+done+' / '+total+' MiB)';
+  $('backupPhase').textContent=(s.phase==='retry'?'Ponawianie połączenia — ':'')+s.percent+'% weryfikacji ('+done+' / '+total+' MiB)';
   track.setAttribute('aria-valuenow',String(s.percent));
   track.setAttribute('aria-valuetext','Transfer i weryfikacja '+s.percent+'%');
  }else{
@@ -2237,6 +2647,18 @@ async function backupPoll(){
  if(log.textContent!==lines){const follow=log.scrollHeight-log.scrollTop-log.clientHeight<45;
   log.textContent=lines||'Oczekiwanie na komunikaty…';if(follow)log.scrollTop=log.scrollHeight;}
 }
+$('cancelBackupTransfer').onclick=async()=>{
+ if(!confirm('Przerwać przesyłanie? Lokalna kopia zostanie zachowana, a niepełne fragmenty na SMB nie pojawią się jako gotowa kopia.'))return;
+ const base=window.location.pathname.replace(/\/$/,'');const r=await fetch(base+'/api/backup/cancel',
+ {method:'POST',headers:{'X-Backup-CSRF':backupCancelToken}});
+ const x=await r.json();if(!x.success)alert(x.message);await backupPoll();
+};
+$('cancelRestoreTransfer').onclick=async()=>{
+ if(!confirm('Przerwać pobieranie kopii?'))return;
+ const base=window.location.pathname.replace(/\/$/,'');const r=await fetch(base+'/api/restore/cancel',
+ {method:'POST',headers:{'X-Restore-Cancel-CSRF':restoreCancelToken}});
+ const x=await r.json();if(!x.success)alert(x.message);
+};
 $('runBackup').onclick=async()=>{
  const apps=[...$('apps').querySelectorAll('input[type=checkbox]:checked')].map(x=>x.value);
  const storage=$('backupStorage').value;
@@ -2405,3 +2827,7 @@ refresh().catch(e=>msg(false,e.message));
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5050, debug=False)
+
+
+# Resume unfinished transfers on the next start of this application's service.
+threading.Thread(target=resume_pending_transfer, name='ybm-transfer-resume', daemon=True).start()

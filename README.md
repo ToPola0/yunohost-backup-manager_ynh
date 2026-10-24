@@ -1,3 +1,74 @@
+# YunoHost Backup Manager **0.5~ynh21**
+
+## Postęp pojedynczych części archiwum
+
+- Każda kopia ma **jeden** katalog na udziale SMB; wszystkie `tar.000000.part`, `tar.000001.part` itd., metadane oraz raport znajdują się bezpośrednio w tym samym katalogu.
+- Zakładka „Kopie zapasowe” pokazuje nazwę katalogu, każdą część, jej rozmiar, bieżący etap i rzeczywisty procent transferu lub odczytu SHA256.
+- Po wznowieniu poprawne części są oznaczone jako „Już poprawna — pominięta”, a brakujące lub uszkodzone jako „Wysyłanie” i następnie „Wysłana i sprawdzona”.
+- Przycisk anulowania, raporty, przywracanie i obsługa archiwów starszego typu pozostają bez zmian.
+- Nie dokonano żadnych zmian poza kodem wtyczki.
+
+Przykład katalogu na SMB:
+
+```text
+Archiwum/yunohost/ybm_KGW_20261024_120739_7fc92b/
+  tar.000000.part
+  tar.000001.part
+  tar.000002.part
+  info.000000.part
+  report.json
+  complete.json
+```
+
+`pending.json` jest przejściowym plikiem stanu, usuwanym po poprawnym zakończeniu operacji. `complete.json` powstaje dopiero po sprawdzeniu całej kopii.
+
+---
+
+# YunoHost Backup Manager **0.5~ynh20**
+
+## Nowość: niezawodne przesyłanie dużych kopii w częściach
+
+- Każda nowa kopia trafia do osobnego folderu na udział SMB.
+- Archiwum jest przesyłane w częściach po **256 MiB**, bez tworzenia lokalnych duplikatów `.tar`.
+- Po zerwaniu połączenia wtyczka **automatycznie ponawia próby** (5–60 s) i za każdym razem weryfikuje części SHA256 przed pominięciem lub ponownym przesłaniem.
+- Stan zadania zapisuje wyłącznie w katalogu danych wtyczki i automatycznie wznawia transfer po restarcie usługi.
+- Dopiero po pełnym odczycie kontrolnym wszystkich części i zapisaniu raportu publikuje `complete.json`. Wcześniej kopia nie pojawia się na liście gotowych archiwów.
+- W panelu znajduje się przycisk **„Przerwij przesyłanie kopii”**. Anulowanie zatrzymuje próby, ale pozostawia lokalne archiwum do kontroli.
+- Przywracanie pobiera części z kontrolą SHA256 i składa je w oryginalne pliki `.tar` oraz `.info.json` YunoHost.
+- Przywracanie, przeglądanie raportów i usuwanie kopii obsługuje zarówno nowy format, jak i starsze archiwa `.tar`.
+- Nie zmienia konfiguracji YunoHost, Tailscale, OMV, Proxmoxa ani systemowego crona.
+
+### Układ pojedynczej nowej kopii na SMB
+
+```text
+Archiwum/yunohost/ybm_Balchan_20261024_113000_abcdef/
+  tar.000000.part
+  tar.000001.part
+  ...
+  info.000000.part
+  report.json
+  complete.json   # pojawia się wyłącznie po pełnej weryfikacji
+```
+
+### Ważne ograniczenia
+
+- YunoHost najpierw tworzy lokalne `.tar`, dlatego konieczne jest miejsce na jedno archiwum lokalne; nie powstaje drugi plik podczas dzielenia.
+- Automatyczne wznowienie po restarcie dotyczy **etapu transferu gotowego archiwum**. Przerwanej w połowie operacji `yunohost backup create` nie uruchamia się automatycznie ponownie, aby nie ryzykować uszkodzenia archiwum.
+- Przywracanie nadal wymaga wolnego miejsca na pełne archiwum, a działania wewnątrz YunoHost nie są automatycznie ponawiane po błędzie.
+- Pliki częściowo przesłane pozostają na SMB jako robocze dane do wznowienia, ale **nie są prezentowane jako kompletne kopie**.
+
+---
+
+# YunoHost Backup Manager **0.5~ynh19**
+
+## Nowość: odnośnik powrotny do YunoHost
+
+- Kliknięcie napisu **YunoHost** w górnym lewym rogu panelu otwiera panel administracyjny pod adresem `/yunohost/admin/` na tej samej domenie.
+- Link jest dostępny z klawiatury, ma wyraźne wyróżnienie po najechaniu i działa także na telefonie.
+- Pozostałe funkcje kopii, przywracania, magazynów, harmonogramów oraz aktualizacji nie zostały zmienione.
+
+---
+
 # YunoHost Backup Manager **0.5~ynh18**
 
 ## Nowości: usuwanie archiwów bezpośrednio z panelu
@@ -29,7 +100,7 @@
 
 ## Historia: 0.5~ynh16 — poprzednia wersja
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh18**
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh20**
 
 ## Zmiany w 0.5~ynh16 — ponowna instalacja i Harmonogram (cron)
 
