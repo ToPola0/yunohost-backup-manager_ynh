@@ -1,6 +1,18 @@
-# YunoHost Backup Manager — 0.5~ynh11 (wersja testowa)
+# YunoHost Backup Manager — 0.5~ynh13 (wersja testowa)
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh11**
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh13**
+
+## Zmiany w 0.5~ynh13
+
+1. **Postęp tworzenia kopii:** animowany pasek pracy podczas szacowania i tworzenia archiwum YunoHost; przy wysyłaniu i weryfikacji danych SMB rzeczywisty procent oraz liczba przetworzonych MiB.
+2. **Dziennik kopii:** widoczny pod przyciskiem „Wykonaj kopię”, automatycznie uzupełniany o nazwy plików i etapy. Po zakończeniu pasek jest zielony, przy błędzie czerwony.
+3. **Aktualizacja z menu aplikacji:** ulepszona weryfikacja numeru wersji na dysku i w działającym panelu. Fałszywy sukces lub niepodmienione pliki zostaną zgłoszone jako błąd.
+4. **Weryfikacja SHA256:** sumy kontrolne danych wysłanych i odczytanych z SMB są porównywane przed usunięciem kopii lokalnej.
+5. **Bez zmian poza wtyczką:** konfiguracja Proxmoxa, kontenera, Tailscale i OMV pozostaje nienaruszona.
+
+### Aktualizacja
+
+Po opublikowaniu całej paczki w gałęzi `main` repozytorium użyj w panelu **Sprawdź aktualizacje → Aktualizuj aplikację**. Sprawdź w panelu numer wersji po ukończeniu operacji; sam komunikat YunoHost „SUCCESS” nie jest dowodem, że uruchomiony panel został zmieniony.
 
 ## Zmiany w 0.5~ynh11
 

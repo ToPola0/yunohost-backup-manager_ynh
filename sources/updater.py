@@ -9,7 +9,7 @@ import time
 import urllib.request
 
 APP_ID = 'yunohost-backup-manager'
-APP_VERSION = '0.5~ynh11'
+APP_VERSION = '0.5~ynh13'
 REPOSITORY = 'https://github.com/ToPola0/yunohost-backup-manager_ynh'
 MANIFEST_URL = 'https://raw.githubusercontent.com/ToPola0/yunohost-backup-manager_ynh/main/manifest.toml'
 DATA_DIR = Path(__file__).resolve().parent / 'data'
@@ -42,6 +42,16 @@ def read_state():
         with STATE_FILE.open('r', encoding='utf-8') as file:
             result = json.load(file)
         if isinstance(result, dict) and result.get('status') in ('launching','running','success','error'):
+            if result['status'] == 'success' and result.get('target') != APP_VERSION:
+                target = str(result.get('target', ''))
+                # A previous green status must never imply that the running
+                # worker actually updated to the newer requested version.
+                if target and subprocess.run(['dpkg', '--compare-versions', target, 'gt', APP_VERSION],
+                                             check=False, timeout=5).returncode == 0:
+                    return {'status': 'error', 'target': target,
+                            'message': 'Aktualizacja zgłosiła sukces, ale panel nadal działa w wersji '
+                                       + APP_VERSION + '. Sprawdź log aktualizacji.'}
+                return {'status': 'idle', 'message': 'Panel działa w wersji ' + APP_VERSION + '.'}
             if result['status'] in ('launching', 'running'):
                 started = result.get('started_at')
                 if isinstance(started, (int, float)) and time.time() - started > 10800:

@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 source /usr/share/yunohost/helpers
 # Data is managed separately to avoid deleting credentials during upgrades.
 cp ../sources/app.py "$install_dir/app.py"

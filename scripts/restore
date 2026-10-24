@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 source /usr/share/yunohost/helpers
 ynh_restore "$data_dir"
 cp ../sources/app.py "$install_dir/app.py"

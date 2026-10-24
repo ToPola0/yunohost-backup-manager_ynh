@@ -313,7 +313,65 @@ def delete_storage(storage_id):
 # Wykonywanie kopii jest dostępne tylko bezpośrednio na serwerze YunoHost.
 BACKUP_DIR = pathlib.Path('/home/yunohost.backup/archives')
 BACKUP_LOCK = threading.Lock()
-BACKUP_STATE = {'status': 'idle', 'message': 'Brak uruchomionej kopii.', 'details': []}
+BACKUP_STATE_GUARD = threading.RLock()
+BACKUP_STATE = {'status': 'idle', 'phase': 'idle', 'percent': None,
+                'message': 'Brak uruchomionej kopii.', 'details': [],
+                'done_bytes': 0, 'total_bytes': 0, 'log': []}
+
+
+def backup_event(message, phase=None, status=None, percent=None, reset=False):
+    """Report verified stages; never invent a percentage for YunoHost CLI work."""
+    with BACKUP_STATE_GUARD:
+        if reset:
+            BACKUP_STATE.update(log=[], done_bytes=0, total_bytes=0, details=[])
+        BACKUP_STATE['message'] = message
+        BACKUP_STATE['percent'] = percent
+        if phase is not None:
+            BACKUP_STATE['phase'] = phase
+        if status is not None:
+            BACKUP_STATE['status'] = status
+        BACKUP_STATE['log'] = (BACKUP_STATE['log'] +
+                               [time.strftime('%H:%M:%S') + '  ' + message])[-140:]
+
+
+class BackupMeter:
+    """Counts bytes sent and received from SMB for the selected archives."""
+    def __init__(self, files):
+        self.total = 2 * sum(path.stat().st_size for path in files)
+        self.done = 0
+        with BACKUP_STATE_GUARD:
+            BACKUP_STATE['total_bytes'] = self.total
+            BACKUP_STATE['done_bytes'] = 0
+            BACKUP_STATE['percent'] = 0
+
+    def advance(self, count):
+        if count <= 0:
+            return
+        with BACKUP_STATE_GUARD:
+            self.done += count
+            BACKUP_STATE['done_bytes'] = self.done
+            BACKUP_STATE['percent'] = min(100, int(self.done * 100 / max(self.total, 1)))
+
+
+class MeteredReader:
+    """Hash original bytes while tracking actual SMB uploads."""
+    def __init__(self, stream, meter):
+        self.stream = stream
+        self.meter = meter
+        self.digest = hashlib.sha256()
+        self.count = 0
+
+    def read(self, size=-1):
+        chunk = self.stream.read(size)
+        if chunk:
+            self.digest.update(chunk)
+            self.count += len(chunk)
+            self.meter.advance(len(chunk))
+        return chunk
+
+    def __getattr__(self, key):
+        return getattr(self.stream, key)
+
 
 
 def on_yunohost():
@@ -347,13 +405,16 @@ def cfg_from_storage(storage_id):
 
 
 class HashWriter:
-    def __init__(self):
+    def __init__(self, meter=None):
         self.digest = hashlib.sha256()
         self.count = 0
+        self.meter = meter
 
     def write(self, chunk):
         self.digest.update(chunk)
         self.count += len(chunk)
+        if self.meter is not None:
+            self.meter.advance(len(chunk))
         return len(chunk)
 
 
@@ -385,7 +446,7 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def transfer_legacy(cfg, files):
+def transfer_legacy(cfg, files, meter):
     with SMB_LOCK:
         with smb_endpoint(cfg['server']) as endpoint:
             conn = connect_legacy(cfg, True, endpoint.host, endpoint.port)
@@ -394,17 +455,26 @@ def transfer_legacy(cfg, files):
                 ensure_legacy_dirs(conn, cfg)
                 for path in files:
                     target = folder + '/' + path.name
-                    with path.open('rb') as f:
-                        conn.storeFile(cfg['share'], target, f, timeout=7200)
-                    verifier = HashWriter()
+                    backup_event('SMB1: wysyłanie ' + path.name, phase='transfer',
+                                 percent=BACKUP_STATE['percent'])
+                    with path.open('rb') as stream:
+                        source = MeteredReader(stream, meter)
+                        conn.storeFile(cfg['share'], target, source, timeout=7200)
+                    backup_event('SMB1: weryfikacja SHA256 ' + path.name, phase='transfer',
+                                 percent=BACKUP_STATE['percent'])
+                    verifier = HashWriter(meter)
                     conn.retrieveFile(cfg['share'], target, verifier, timeout=7200)
-                    if verifier.count != path.stat().st_size or verifier.digest.hexdigest() != file_hash(path):
+                    if (verifier.count != source.count or
+                            verifier.count != path.stat().st_size or
+                            verifier.digest.digest() != source.digest.digest()):
                         raise RuntimeError('Błąd weryfikacji SMB: ' + path.name)
+                    backup_event('SMB1: SHA256 zgodne dla ' + path.name,
+                                 phase='transfer', percent=BACKUP_STATE['percent'])
             finally:
                 conn.close()
 
 
-def transfer_modern(cfg, files):
+def transfer_modern(cfg, files, meter):
     cache = {}
     user = (cfg['domain'] + '\\' if cfg['domain'] else '') + cfg['username']
     with smb_endpoint(cfg['server']) as endpoint:
@@ -419,14 +489,23 @@ def transfer_modern(cfg, files):
             ensure_modern_dirs(cfg, cache, server, endpoint.port)
             for path in files:
                 target = root + '\\' + path.name
-                with path.open('rb') as source, smbclient.open_file(target, 'wb', port=endpoint.port, connection_cache=cache) as dest:
+                backup_event('SMB2/3: wysyłanie ' + path.name, phase='transfer',
+                             percent=BACKUP_STATE['percent'])
+                with path.open('rb') as stream, smbclient.open_file(target, 'wb', port=endpoint.port, connection_cache=cache) as dest:
+                    source = MeteredReader(stream, meter)
                     shutil.copyfileobj(source, dest, 1024 * 1024)
-                verifier = HashWriter()
-                with smbclient.open_file(target, 'rb', port=endpoint.port, connection_cache=cache) as source:
-                    for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                backup_event('SMB2/3: weryfikacja SHA256 ' + path.name, phase='transfer',
+                             percent=BACKUP_STATE['percent'])
+                verifier = HashWriter(meter)
+                with smbclient.open_file(target, 'rb', port=endpoint.port, connection_cache=cache) as remote:
+                    for chunk in iter(lambda: remote.read(1024 * 1024), b''):
                         verifier.write(chunk)
-                if verifier.count != path.stat().st_size or verifier.digest.hexdigest() != file_hash(path):
+                if (verifier.count != source.count or
+                        verifier.count != path.stat().st_size or
+                        verifier.digest.digest() != source.digest.digest()):
                     raise RuntimeError('Błąd weryfikacji SMB: ' + path.name)
+                backup_event('SMB2/3: SHA256 zgodne dla ' + path.name,
+                             phase='transfer', percent=BACKUP_STATE['percent'])
         finally:
             try:
                 smbclient.delete_session(server, port=endpoint.port, connection_cache=cache)
@@ -436,10 +515,11 @@ def transfer_modern(cfg, files):
 
 def backup_worker(app_ids, storage_id, app_names):
     try:
-        BACKUP_STATE.update(status='running', message='Sprawdzanie miejsca...', details=[])
-        # Zapobiegamy przepełnieniu dysku: zapas 1 GiB ponad szacowaną wielkość.
+        backup_event('Sprawdzanie wolnego miejsca i rozmiaru kopii…',
+                     phase='prepare', status='running')
         estimated = 0
         for app_id in app_ids:
+            backup_event('Szacowanie miejsca: ' + app_id, phase='prepare')
             output = yn_command('backup', 'create', '--apps', app_id, '--dry-run', timeout=300)
             match = re.search(r'(?m)^size:\s*(\d+)\s*$', output)
             if not match:
@@ -450,40 +530,51 @@ def backup_worker(app_ids, storage_id, app_names):
             raise RuntimeError('Za mało wolnego miejsca na kopię lokalną.')
         cfg = cfg_from_storage(storage_id)
         name = backup_archive_name(app_ids, app_names)
-        BACKUP_STATE['message'] = 'Tworzenie archiwum ' + name + ' dla aplikacji: ' + ', '.join(app_names)
-        # Używamy jednej kopii z wybranymi aplikacjami.
+        backup_event('YunoHost tworzy archiwum ' + name + ' (' + ', '.join(app_names) + ')',
+                     phase='create')
         yn_command('backup', 'create', '--apps', *app_ids, '--name', name)
         files = [BACKUP_DIR / (name + '.tar'), BACKUP_DIR / (name + '.info.json')]
         if not all(f.is_file() and f.stat().st_size > 0 for f in files):
             raise RuntimeError('Niekompletna kopia lokalna; pliki pozostają na dysku.')
-        BACKUP_STATE['message'] = 'Przesyłanie i weryfikacja obu plików na SMB...'
+        meter = BackupMeter(files)
+        total_mib = sum(path.stat().st_size for path in files) / 1024**2
+        backup_event(f'Archiwum gotowe ({total_mib:.1f} MiB). Rozpoczynam wysyłanie i kontrolę SHA256.',
+                     phase='transfer', percent=0)
         if cfg['protocol'] == 'smb1':
-            transfer_legacy(cfg, files)
+            transfer_legacy(cfg, files, meter)
         elif cfg['protocol'] == 'smb2':
-            transfer_modern(cfg, files)
+            transfer_modern(cfg, files, meter)
         else:
-            # Ustal protokół PRZED transferem; nie ponawiaj po błędzie weryfikacji.
             try:
                 modern_test(cfg)
-            except Exception:
+            except Exception as exc:
+                backup_event('SMB2/3 niedostępny, sprawdzanie SMB1: ' + str(exc)[:200],
+                             phase='transfer', percent=0)
                 legacy_test(cfg)
-                transfer_legacy(cfg, files)
+                transfer_legacy(cfg, files, meter)
             else:
-                transfer_modern(cfg, files)
-        BACKUP_STATE['message'] = 'Weryfikacja zakończona. Usuwanie lokalnej kopii...'
+                transfer_modern(cfg, files, meter)
+        backup_event('Weryfikacja ukończona. YunoHost usuwa lokalną kopię archiwum…',
+                     phase='cleanup', percent=None)
         yn_command('backup', 'delete', name, timeout=120)
-        BACKUP_STATE.update(status='success', message='Kopia ' + name + ' przesłana i zweryfikowana. Lokalna usunięta.',
-                            details=['Aplikacje: ' + ', '.join(f'{n} ({i})' for n, i in zip(app_names, app_ids))] + [f.name for f in files])
+        with BACKUP_STATE_GUARD:
+            BACKUP_STATE['details'] = (['Aplikacje: ' + ', '.join(f'{n} ({i})' for n,i in zip(app_names,app_ids))] +
+                                       [f.name for f in files])
+        backup_event('Kopia ' + name + ' przesłana, zweryfikowana (SHA256) i usunięta lokalnie.',
+                     phase='complete', status='success', percent=100)
     except Exception as exc:
-        BACKUP_STATE.update(status='error',
-                            message=str(exc) + ' Kopia lokalna, jeśli powstała, nie została celowo usunięta.')
+        backup_event(str(exc) + ' Kopia lokalna, jeśli powstała, nie została celowo usunięta.',
+                     phase='error', status='error')
     finally:
         BACKUP_LOCK.release()
 
 
 @app.get('/api/backup/status')
 def backup_status():
-    return jsonify(success=True, available=on_yunohost(), **BACKUP_STATE)
+    with BACKUP_STATE_GUARD:
+        snapshot = {**BACKUP_STATE, 'log': list(BACKUP_STATE['log']),
+                    'details': list(BACKUP_STATE['details'])}
+    return jsonify(success=True, available=on_yunohost(), **snapshot)
 
 
 @app.post('/api/backup/start')
@@ -505,7 +596,7 @@ def backup_start():
         return jsonify(success=False, message='Trwa aktualizacja aplikacji. Poczekaj na zakończenie.'), 409
     if not BACKUP_LOCK.acquire(blocking=False):
         return jsonify(success=False, message='Kopia już trwa.'), 409
-    BACKUP_STATE.update(status='running', message='Rozpoczynanie...', details=[])
+    backup_event('Rozpoczynanie kopii…', phase='prepare', status='running', reset=True)
     threading.Thread(target=backup_worker, args=(app_ids, storage_id, [app_labels[a] for a in app_ids]), daemon=True).start()
     return jsonify(success=True, message='Rozpoczęto wykonywanie kopii.')
 
@@ -661,14 +752,20 @@ textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border
 #updateLogPanel .actions{margin:0;padding:8px 10px;background:#f1f5fa}
 #updateLogPanel .actions button{padding:7px 12px;font-size:12px}
 #updateLogPanel[hidden],#updateProgress[hidden]{display:none}
+#backupProgress{margin-top:18px}
+#backupLogPanel{margin-top:14px;border:1px solid #d8e0eb;border-radius:7px;overflow:hidden}
+#backupLogPanel summary{cursor:pointer;user-select:none;padding:12px 14px;font-weight:600;background:#f1f5fa;color:#334d71}
+#backupLogPanel pre{font:12px/1.55 Consolas,'Liberation Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:300px;min-height:80px;margin:0;padding:14px;color:#d8e7ff;background:#142136}
+#backupProgress[hidden],#backupLogPanel[hidden]{display:none}
+.update-track.measured .update-progress-fill{animation:none;left:0;width:0%;transition:width .25s ease}
 #importProgress{margin-top:18px}
 #importLogPanel{margin-top:14px;border:1px solid #d8e0eb;border-radius:7px;overflow:hidden}
 #importLogPanel summary{cursor:pointer;user-select:none;padding:12px 14px;font-weight:600;background:#f1f5fa;color:#334d71}
 #importLogPanel pre{font:12px/1.55 Consolas,'Liberation Mono',monospace;white-space:pre-wrap;overflow-wrap:anywhere;overflow-y:auto;max-height:240px;min-height:65px;margin:0;padding:14px;color:#d8e7ff;background:#142136}
 #importLogPanel[hidden],#importProgress[hidden]{display:none}
-</style></head><body><header style="display:flex;align-items:center;gap:12px"><img id="appLogo" alt="" width="48" height="48" style="border-radius:9px;object-fit:contain"><span>YunoHost Backup Manager <small style="color:#cad5e5">0.5~ynh11</small></span></header><main>
+</style></head><body><header style="display:flex;align-items:center;gap:12px"><img id="appLogo" alt="" width="48" height="48" style="border-radius:9px;object-fit:contain"><span>YunoHost Backup Manager <small style="color:#cad5e5">0.5~ynh13</small></span></header><main>
 <section class="panel" id="updatePanel"><h2>Aktualizacje aplikacji</h2>
-<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh11</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
+<p>Wersja zainstalowana: <strong id="versionInstalled">0.5~ynh13</strong> &nbsp;|&nbsp; GitHub: <strong id="versionRemote">Sprawdzanie...</strong></p>
 <div id="updateMessage" class="message" style="display:none"></div>
 <div class="actions"><button type="button" id="checkUpdate" class="secondary">Sprawdź aktualizacje</button><button type="button" id="startUpdate" disabled>Aktualizuj aplikację</button></div>
 <div id="updateProgress" hidden>
@@ -697,6 +794,12 @@ textarea{width:100%;min-height:95px;padding:11px;border:1px solid #c7d0de;border
 <div id="apps"><small>Wczytywanie aplikacji...</small></div>
 <label for="backupStorage">Magazyn docelowy</label><select id="backupStorage"><option value="">Wybierz magazyn</option></select>
 <div class="actions"><button type="button" id="runBackup" disabled>Wykonaj kopię</button></div>
+<div id="backupProgress" hidden>
+  <div class="update-progress-caption"><strong id="backupStage">Przygotowywanie kopii</strong><span id="backupPhase">Trwa praca…</span></div>
+  <div id="backupTrack" class="update-track" role="progressbar" aria-label="Postęp wykonywania kopii" aria-valuetext="Trwa praca"><span id="backupFill" class="update-progress-fill"></span></div>
+</div>
+<details id="backupLogPanel" hidden open><summary>Podgląd tworzenia kopii (log)</summary>
+<pre id="backupLogText" role="log" aria-label="Log tworzenia kopii">Oczekiwanie na uruchomienie…</pre></details>
 <details style="margin-top:22px"><summary>Importuj listę aplikacji z YunoHost (tryb lokalny)</summary>
 <p><small>Wklej wynik polecenia <code>yunohost app list --output-as json</code>. Nie podawaj haseł.</small></p>
 <textarea id="appsJson" placeholder='{"apps":[{"id":"wordpress","name":"Bałchan","domain_path":"strona.rpkj.ovh/organypiszczalkowe"}]}'></textarea>
@@ -766,6 +869,32 @@ async function backupPoll(){
  const s=await api('/api/backup/status');const btn=$('runBackup');btn.disabled=!s.available||s.status==='running';
  const box=$('backupMessage');box.style.display='block';box.className='message '+(s.status==='error'?'error':'ok');
  box.textContent=s.available?s.message:'Tryb Windows: kopie będą dostępne po uruchomieniu aplikacji na YunoHost.';
+ const progress=$('backupProgress'),logPanel=$('backupLogPanel'),track=$('backupTrack'),fill=$('backupFill');
+ if(s.status==='idle'){progress.hidden=true;logPanel.hidden=true;return}
+ progress.hidden=false;logPanel.hidden=false;track.className='update-track';fill.style.width='';
+ const names={prepare:'Sprawdzanie miejsca',create:'Tworzenie archiwum YunoHost',
+              transfer:'Transfer i weryfikacja SMB',cleanup:'Usuwanie kopii lokalnej',
+              complete:'Kopia zakończona',error:'Błąd tworzenia kopii'};
+ $('backupStage').textContent=names[s.phase]||'Tworzenie kopii';
+ if(s.status==='success'){
+  track.classList.add('complete');$('backupPhase').textContent='Gotowe';
+  track.setAttribute('aria-valuetext','Kopia zweryfikowana i zakończona');
+ }else if(s.status==='error'){
+  track.classList.add('failed');$('backupPhase').textContent='Zobacz log';
+  track.setAttribute('aria-valuetext','Nie udało się wykonać kopii');
+ }else if(s.phase==='transfer' && typeof s.percent==='number'){
+  track.classList.add('measured');fill.style.width=Math.min(100,Math.max(0,s.percent))+'%';
+  const done=(s.done_bytes/1048576).toFixed(1),total=(s.total_bytes/1048576).toFixed(1);
+  $('backupPhase').textContent=s.percent+'% transmisji i weryfikacji ('+done+' / '+total+' MiB)';
+  track.setAttribute('aria-valuenow',String(s.percent));
+  track.setAttribute('aria-valuetext','Transfer i weryfikacja '+s.percent+'%');
+ }else{
+  track.removeAttribute('aria-valuenow');$('backupPhase').textContent='Postęp w logu poniżej';
+  track.setAttribute('aria-valuetext','Trwa '+(names[s.phase]||'tworzenie kopii'));
+ }
+ const log=$('backupLogText'),lines=(s.log||[]).join('\n');
+ if(log.textContent!==lines){const follow=log.scrollHeight-log.scrollTop-log.clientHeight<45;
+  log.textContent=lines||'Oczekiwanie na komunikaty…';if(follow)log.scrollTop=log.scrollHeight;}
 }
 $('runBackup').onclick=async()=>{
  const apps=[...$('apps').querySelectorAll('input[type=checkbox]:checked')].map(x=>x.value);
@@ -855,6 +984,11 @@ async function pollUpdates(){
  updatePollLoading=true;
  try{
   const s=await api('/api/updates/status');if(!s.success)return;
+  // Version in the running process, not the old page's built-in label.
+  if(s.installed && $('versionInstalled').textContent!==s.installed){
+   $('versionInstalled').textContent=s.installed;
+   if(!updating)checkUpdates().catch(()=>{});
+  }
   const state=s.state, status=state.status;
   const run=String(state.started_at||'')+':'+String(state.target||'');
   if(run!==':'&&updateLastRun&&run!==updateLastRun){clearUpdateLog()}
@@ -865,6 +999,11 @@ async function pollUpdates(){
   }else if(['success','error'].includes(status)){
    if(updating||status==='error')updateInfo(status==='success',state.message+(status==='success'?' Panel działa już w nowej wersji.':''));
    updating=false;showUpdateProgress(status);await fetchUpdateLog();
+   if(status==='success' && s.installed===state.target && availableUpdate===state.target){
+    availableUpdate='';$('versionInstalled').textContent=s.installed;
+    $('versionRemote').textContent=s.installed;
+    $('startUpdate').disabled=true;updateInfo(true,'Aplikacja jest aktualna: '+s.installed);
+   }
   }
  }catch(e){if(updating)updateInfo(true,'Trwa aktualizacja — oczekiwanie na ponowne uruchomienie panelu...')}
  finally{updatePollLoading=false}
