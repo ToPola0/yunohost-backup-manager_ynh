@@ -135,16 +135,16 @@ def ensure_legacy_dirs(conn, cfg):
             conn.listPath(cfg['share'], current + '/', timeout=10)
 
 
-def ensure_modern_dirs(cfg, cache, server):
+def ensure_modern_dirs(cfg, cache, server, port):
     root = '\\\\' + server + '\\' + cfg['share']
     for part in cfg['subdirectory'].split('/') if cfg['subdirectory'] else []:
         root += '\\' + part
         try:
-            smbclient.mkdir(root, connection_cache=cache)
+            smbclient.mkdir(root, port=port, connection_cache=cache)
         except FileExistsError:
             pass
         # Confirm that the path exists and is accessible.
-        smbclient.listdir(root, connection_cache=cache)
+        smbclient.listdir(root, port=port, connection_cache=cache)
 
 
 def legacy_test(cfg):
@@ -182,18 +182,18 @@ def modern_test(cfg):
             smbclient.register_session(server, username=user,
                                        password=cfg['password'], port=endpoint.port,
                                        connection_timeout=15, connection_cache=cache)
-            ensure_modern_dirs(cfg, cache, server)
-            smbclient.listdir(root, connection_cache=cache)
-            with smbclient.open_file(path, mode='wb', connection_cache=cache) as f:
+            ensure_modern_dirs(cfg, cache, server, endpoint.port)
+            smbclient.listdir(root, port=endpoint.port, connection_cache=cache)
+            with smbclient.open_file(path, mode='wb', port=endpoint.port, connection_cache=cache) as f:
                 f.write(b'YunoHost Backup Manager test')
             try:
-                smbclient.remove(path, connection_cache=cache)
+                smbclient.remove(path, port=endpoint.port, connection_cache=cache)
             except Exception as e:
                 raise RuntimeError(f'Plik zapisany, ale nieusunięty: {name}. {e}')
             return 'SMB2/3' + (' przez Tailscale' if endpoint.via_tailscale else '')
         finally:
             try:
-                smbclient.delete_session(server, connection_cache=cache)
+                smbclient.delete_session(server, port=endpoint.port, connection_cache=cache)
             except Exception:
                 pass
 
@@ -391,20 +391,20 @@ def transfer_modern(cfg, files):
             smbclient.register_session(server, username=user,
                                        password=cfg['password'], port=endpoint.port,
                                        connection_timeout=15, connection_cache=cache)
-            ensure_modern_dirs(cfg, cache, server)
+            ensure_modern_dirs(cfg, cache, server, endpoint.port)
             for path in files:
                 target = root + '\\' + path.name
-                with path.open('rb') as source, smbclient.open_file(target, 'wb', connection_cache=cache) as dest:
+                with path.open('rb') as source, smbclient.open_file(target, 'wb', port=endpoint.port, connection_cache=cache) as dest:
                     shutil.copyfileobj(source, dest, 1024 * 1024)
                 verifier = HashWriter()
-                with smbclient.open_file(target, 'rb', connection_cache=cache) as source:
+                with smbclient.open_file(target, 'rb', port=endpoint.port, connection_cache=cache) as source:
                     for chunk in iter(lambda: source.read(1024 * 1024), b''):
                         verifier.write(chunk)
                 if verifier.count != path.stat().st_size or verifier.digest.hexdigest() != file_hash(path):
                     raise RuntimeError('Błąd weryfikacji SMB: ' + path.name)
         finally:
             try:
-                smbclient.delete_session(server, connection_cache=cache)
+                smbclient.delete_session(server, port=endpoint.port, connection_cache=cache)
             except Exception:
                 pass
 

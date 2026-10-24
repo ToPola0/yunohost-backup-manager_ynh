@@ -1,10 +1,17 @@
-# YunoHost Backup Manager — 0.5~ynh7 (wersja testowa)
+# YunoHost Backup Manager — 0.5~ynh8 (wersja testowa)
 
-**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh7**
+**BIEŻĄCA WERSJA PAKIETU: 0.5~ynh8**
 
 Natywna aplikacja YunoHost 12.1, wykonująca i weryfikująca kopie na udziałach SMB1/SMB2/SMB3.
 
-## Nowości w wersji 0.5~ynh7
+## Poprawka w wersji 0.5~ynh8
+
+- Poprawiono test odczytu i zapisu SMB2/SMB3 na serwerach dostępnych przez Tailscale `userspace-networking`.
+- Każde wywołanie biblioteki `smbclient` używa portu lokalnego przekierowania zamiast domyślnego `127.0.0.1:445` (również tworzenie katalogów, zapis, odczyt, usuwanie i zamknięcie sesji).
+- Zachowano obsługę SMB1, zapisane magazyny, dane, automatyczny aktualizator i szyfrowane hasła.
+- Nie zmieniono konfiguracji systemowej, Proxmoxa, OMV, sieci ani Tailscale.
+
+## Funkcje wbudowane od wersji 0.5~ynh7
 
 - Panel **Aktualizacje aplikacji** pokazuje wersję zainstalowaną i sprawdza wersję w repozytorium GitHub (`main/manifest.toml`).
 - Przycisk **Sprawdź aktualizacje**, komunikat o nowej wersji i przycisk **Aktualizuj aplikację** z potwierdzeniem.
@@ -14,16 +21,14 @@ Natywna aplikacja YunoHost 12.1, wykonująca i weryfikująca kopie na udziałach
 - Nie wykonuje aktualizacji w trakcie tworzenia kopii zapasowej.
 - Zachowano wszystkie funkcje 0.5~ynh6, w tym obsługę SMB przez `tailscale nc` w ramach aplikacji.
 
-## Jednorazowa aktualizacja z wersji 0.5~ynh5
+## Aktualizacja z wersji 0.5~ynh7
 
 1. Rozpakuj całe archiwum ZIP i zastąp pliki w gałęzi `main`: https://github.com/ToPola0/yunohost-backup-manager_ynh
-2. W PuTTY na YunoHost wykonaj:
-
-   `sudo yunohost app upgrade yunohost-backup-manager --url https://github.com/ToPola0/yunohost-backup-manager_ynh`
+2. W panelu wtyczki wybierz **Sprawdź aktualizacje**, a następnie **Aktualizuj aplikację**. Nie odinstalowuj jej.
 
 3. Otwórz panel `https://strona.rpkj.ovh/backup-manager/` i znajdź sekcję **Aktualizacje aplikacji**.
 
-**Kolejne aktualizacje będą dostępne z poziomu panelu** po publikacji nowej wersji w tym samym repozytorium.
+**Kolejne aktualizacje są dostępne z poziomu panelu** po publikacji nowej wersji w tym samym repozytorium.
 
 ## Uwagi
 
