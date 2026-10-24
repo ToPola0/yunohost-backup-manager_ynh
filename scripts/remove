@@ -1,5 +1,5 @@
 #!/bin/bash
 source /usr/share/yunohost/helpers
 systemctl disable --now "$app" 2>/dev/null || true
-ynh_remove_systemd_config
-ynh_remove_nginx_config
+ynh_config_remove_systemd
+ynh_config_remove_nginx

@@ -6,8 +6,8 @@ ln -s "$data_dir" "$install_dir/data"
 chmod 700 "$data_dir"
 python3 -m venv "$install_dir/venv"
 "$install_dir/venv/bin/pip" install --disable-pip-version-check 'Flask==3.1.3' 'cryptography' 'smbprotocol==1.17.0' 'pysmb' 'gunicorn'
-ynh_add_nginx_config
-ynh_add_systemd_config
+ynh_config_add_nginx
+ynh_config_add_systemd
 systemctl daemon-reload
 systemctl enable "$app"
 systemctl restart "$app"

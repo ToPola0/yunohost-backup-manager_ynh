@@ -1,3 +1,3 @@
 #!/bin/bash
 source /usr/share/yunohost/helpers
-ynh_backup --src_path="$data_dir"
+ynh_backup "$data_dir"
