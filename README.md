@@ -1,3 +1,18 @@
+# YunoHost Backup Manager **0.5~ynh26**
+
+## Nowości
+
+- **Motyw ciemny** — dyskretny przełącznik „Ciemny motyw / Jasny motyw” w górnym pasku; zapamiętuje wybór przeglądarki i przy pierwszym uruchomieniu uwzględnia motyw systemowy. Pozostaje zwarty układ z wersji 0.5~ynh25.
+- **Rotacja kopii w harmonogramie** — nowe pole **„Zachowaj ostatnie kopie na SMB”**, od 0 (bez limitu) do 365. Nowe i dotychczasowe harmonogramy mają domyślnie **0**, co chroni istniejące archiwa.
+- Dopiero po pomyślnym przesłaniu i zweryfikowaniu nowej kopii usuwane są **najstarsze ukończone kopie utworzone przez TEN SAM harmonogram na TYM SAMYM magazynie**; kopie ręczne, innych harmonogramów, niekompletne i stare kopie bez identyfikatora harmonogramu są pomijane.
+- Przynależność zapisywana jest w `complete.json` i potwierdzana raportem SHA256; weryfikacja i usuwanie odbywają się wyłącznie przez istniejący transport wtyczki SMB.
+- Jeżeli usunięcie starych archiwów się nie powiedzie, **nowa kopia nadal zachowuje status udanej**, a błąd rotacji jest odnotowany w logu i ostatnim wyniku harmonogramu.
+- Już zapisane harmonogramy i magazyny są zachowane; dodawana jest wyłącznie kolumna bazy SQLite wtyczki, bez zmian systemowego crona i konfiguracji zewnętrznych usług.
+
+**Uwaga:** rotacja obejmuje kopie oznaczone identyfikatorem harmonogramu, czyli te wykonane po instalacji wersji 0.5~ynh26. Starsze, nieoznaczone kopie nie są usuwane automatycznie. Kopie usunięte przez rotację nie mogą zostać przywrócone.
+
+---
+
 # YunoHost Backup Manager **0.5~ynh25**
 
 ## Zmiany w 0.5~ynh25 — zwarty, subtelny panel

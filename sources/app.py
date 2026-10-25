@@ -75,8 +75,12 @@ with db_connect() as db:
     db.execute('''CREATE TABLE IF NOT EXISTS harmonogramy (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, cron TEXT NOT NULL,
         storage_id TEXT NOT NULL, apps_json TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
-        last_slot TEXT, last_run TEXT, last_result TEXT DEFAULT 'Nie uruchomiono'
+        last_slot TEXT, last_run TEXT, last_result TEXT DEFAULT 'Nie uruchomiono',
+        keep_count INTEGER NOT NULL DEFAULT 0
     )''')
+    schedule_columns = {row[1] for row in db.execute('PRAGMA table_info(harmonogramy)')}
+    if 'keep_count' not in schedule_columns:
+        db.execute('ALTER TABLE harmonogramy ADD COLUMN keep_count INTEGER NOT NULL DEFAULT 0')
 
 
 def clean(data, require_share=True, require_id=False):
@@ -457,7 +461,8 @@ def backup_event(message, phase=None, status=None, percent=None, reset=False):
     with BACKUP_STATE_GUARD:
         if reset:
             BACKUP_STATE.update(log=[], done_bytes=0, total_bytes=0, details=[],
-                                archive_folder='', chunks=[], parallel=1, upload_speed=None, parallel_samples={})
+                                archive_folder='', chunks=[], parallel=1, upload_speed=None, parallel_samples={},
+                                retention_warning=None)
         BACKUP_STATE['message'] = message
         BACKUP_STATE['percent'] = percent
         if phase is not None:
@@ -780,6 +785,11 @@ def transfer_resumable(job):
                 if not path.is_file() or not path.stat().st_size:
                     raise RuntimeError('Brakuje lokalnego pliku kopii: ' + path.name)
             manifest = make_manifest(name, files, app_ids, app_names, storage_id, started_at)
+            schedule_id = job.get('schedule_id')
+            if schedule_id is not None:
+                if not isinstance(schedule_id, str) or not re.fullmatch(r'[a-f0-9]{32}', schedule_id):
+                    raise ValueError('Nieprawidłowy identyfikator harmonogramu.')
+                manifest['schedule_id'] = schedule_id
             total = 2 * sum(p.stat().st_size for p in files.values())
             # Every .part, both for the TAR and for the YunoHost metadata, lives
             # directly inside ONE SMB folder named after this backup. The panel
@@ -904,6 +914,8 @@ def transfer_resumable(job):
                 for role in ('tar', 'info'):
                     manifest['files'][role]['sha256'] = hashes[files[role].name]['sha256']
                 report = make_backup_report(name, storage_id, app_ids, app_names, hashes, started_at)
+                if schedule_id is not None:
+                    report['schedule_id'] = schedule_id
                 report['verification'] = ('Każda część archiwum została w całości odczytana z SMB '
                                            'i porównana SHA256 oraz rozmiarem z plikiem lokalnym.')
                 report['chunk_size'] = CHUNK_SIZE
@@ -937,6 +949,18 @@ def transfer_resumable(job):
             backup_event('Kopia ' + name + ' ukończona: wszystkie części SHA256 zgodne, '
                          'manifest opublikowany, lokalne pliki usunięte.',
                          phase='complete', status='success', percent=100)
+            if schedule_id is not None:
+                try:
+                    limit = schedule_keep_count(schedule_id, storage_id)
+                    if limit:
+                        removed = prune_scheduled_backups(cfg, schedule_id, limit, name)
+                        backup_event(f'Harmonogram: zachowano maksymalnie {limit} kopii; usunięto {removed} najstarszych.',
+                                     phase='complete', status='success', percent=100)
+                except Exception as cleanup_error:
+                    warning = 'Kopia jest poprawna, ale rotacja archiwów nie powiodła się: ' + str(cleanup_error)[:240]
+                    with BACKUP_STATE_GUARD:
+                        BACKUP_STATE['retention_warning'] = warning
+                    backup_event(warning, phase='complete', status='success', percent=100)
             return
         except InterruptedError:
             continue  # handled by cancelled() at loop entrance
@@ -952,7 +976,7 @@ def transfer_resumable(job):
                 time.sleep(1)
 
 
-def backup_worker(app_ids, storage_id, app_names):
+def backup_worker(app_ids, storage_id, app_names, schedule_id=None):
     global BACKUP_REPORT
     name = None
     try:
@@ -984,6 +1008,8 @@ def backup_worker(app_ids, storage_id, app_names):
         job = {'format': 'ybm-transfer-v1', 'name': name, 'storage': storage_id,
                'apps': app_ids, 'app_names': app_names, 'started_at': started_at,
                'initial_log': initial_log, 'cancel_requested': False}
+        if schedule_id is not None:
+            job['schedule_id'] = schedule_id
         atomic_transfer_state(job)
         transfer_resumable(job)
     except Exception as exc:
@@ -1244,6 +1270,9 @@ def validate_schedule(data):
     storage = data.get('storage', '')
     apps = data.get('apps', [])
     enabled = data.get('enabled', True)
+    keep_count = data.get('keep_count', 0)
+    if type(keep_count) is not int or not 0 <= keep_count <= 365:
+        raise ValueError('Liczba przechowywanych kopii: 0 (bez limitu) lub 1–365.')
     if not 1 <= len(name) <= 100:
         raise ValueError('Nazwa harmonogramu musi mieć od 1 do 100 znaków.')
     CronSpec(expression)  # parse once before persisting; rejects malformed ranges and steps
@@ -1259,7 +1288,7 @@ def validate_schedule(data):
         raise ValueError('Wybrane aplikacje nie są aktualnie zainstalowane w YunoHost.')
     if not isinstance(enabled, bool):
         raise ValueError('Nieprawidłowy stan harmonogramu.')
-    return name, expression, storage, json.dumps(apps), int(enabled)
+    return name, expression, storage, json.dumps(apps), int(enabled), keep_count
 
 
 @app.post('/api/schedules')
@@ -1269,10 +1298,10 @@ def add_schedule():
     if not on_yunohost():
         return jsonify(success=False, message='Harmonogram jest dostępny tylko na YunoHost.'), 400
     try:
-        name, expr, storage, apps, enabled = validate_schedule(request.get_json(silent=True) or {})
+        name, expr, storage, apps, enabled, keep_count = validate_schedule(request.get_json(silent=True) or {})
         with db_connect() as db:
-            db.execute('INSERT INTO harmonogramy (id,name,cron,storage_id,apps_json,enabled) VALUES (?,?,?,?,?,?)',
-                       (uuid.uuid4().hex, name, expr, storage, apps, enabled))
+            db.execute('INSERT INTO harmonogramy (id,name,cron,storage_id,apps_json,enabled,keep_count) VALUES (?,?,?,?,?,?,?)',
+                       (uuid.uuid4().hex, name, expr, storage, apps, enabled, keep_count))
         return jsonify(success=True, message='Harmonogram został zapisany.')
     except (ValueError, TypeError) as exc:
         return jsonify(success=False, message=str(exc)), 400
@@ -1283,10 +1312,10 @@ def modify_schedule(schedule_id):
     if not schedule_csrf_valid():
         return jsonify(success=False, message='Odśwież zakładkę Harmonogram — wygasło potwierdzenie.'), 403
     try:
-        name, expr, storage, apps, enabled = validate_schedule(request.get_json(silent=True) or {})
+        name, expr, storage, apps, enabled, keep_count = validate_schedule(request.get_json(silent=True) or {})
         with db_connect() as db:
-            result = db.execute('UPDATE harmonogramy SET name=?,cron=?,storage_id=?,apps_json=?,enabled=?,last_slot=NULL WHERE id=?',
-                                (name,expr,storage,apps,enabled,schedule_id))
+            result = db.execute('UPDATE harmonogramy SET name=?,cron=?,storage_id=?,apps_json=?,enabled=?,keep_count=?,last_slot=NULL WHERE id=?',
+                                (name,expr,storage,apps,enabled,keep_count,schedule_id))
         if not result.rowcount:
             return jsonify(success=False, message='Nie znaleziono harmonogramu.'), 404
         return jsonify(success=True, message='Harmonogram zaktualizowany.')
@@ -1313,13 +1342,82 @@ def schedule_result(schedule_id, outcome):
         app.logger.exception('Nie zapisano wyniku harmonogramu')
 
 
+def schedule_keep_count(schedule_id, storage_id):
+    """Return current retention policy only if schedule still targets this store."""
+    with db_connect() as db:
+        item = db.execute('SELECT keep_count,storage_id FROM harmonogramy WHERE id=?',
+                          (schedule_id,)).fetchone()
+    if not item or item['storage_id'] != storage_id:
+        return 0
+    return max(0, min(365, int(item['keep_count'])))
+
+
+def choose_retention_victims(store, schedule_id, keep_count, new_archive):
+    """Read verified completion markers; never touch manual or other schedule backups."""
+    candidates = []
+    for name, entry in store.listing().items():
+        if not entry.directory or not name.startswith('ybm_'):
+            continue
+        try:
+            validate_name(name)
+            manifest = read_manifest(store, name)
+            if manifest is None or manifest.get('schedule_id') != schedule_id:
+                continue
+            # The archive report is bound to completion marker by SHA256.
+            raw = verified_report(store, name, manifest)
+            report = json.loads(raw.decode('utf-8'))
+            if report.get('schedule_id') != schedule_id:
+                continue
+            candidates.append((manifest['completed_at'], name))
+        except (ValueError, KeyError, TypeError, OSError, json.JSONDecodeError):
+            # Suspicious or partial entries must NEVER be deleted automatically.
+            continue
+    # Protect the backup just finished, even if clock time has shifted.
+    if not any(n == new_archive for _, n in candidates):
+        raise RuntimeError('Nowej kopii nie znaleziono wśród ukończonych kopii tego harmonogramu.')
+    candidates.sort(reverse=True)
+    ordered = [new_archive] + [n for _, n in candidates if n != new_archive]
+    return ordered[keep_count:]
+
+
+def prune_scheduled_backups(cfg, schedule_id, keep_count, new_archive):
+    """After success, retain N verified backups from this exact scheduler on this SMB."""
+    if not 1 <= keep_count <= 365 or not re.fullmatch(r'[a-f0-9]{32}', schedule_id):
+        raise ValueError('Nieprawidłowa polityka przechowywania kopii.')
+    dialect = chunk_dialect(cfg)
+
+    def work(store):
+        victims = choose_retention_victims(store, schedule_id, keep_count, new_archive)
+        for old_name in victims:
+            if old_name == new_archive:
+                raise RuntimeError('Próba usunięcia najnowszego archiwum.')
+            # Re-check ownership before destructive operations.
+            current = read_manifest(store, old_name)
+            if current is None or current.get('schedule_id') != schedule_id:
+                raise RuntimeError('Zmieniły się metadane archiwum: ' + old_name)
+            verification = json.loads(verified_report(store, old_name, current).decode('utf-8'))
+            if verification.get('schedule_id') != schedule_id:
+                raise RuntimeError('Nieprawidłowy raport harmonogramu: ' + old_name)
+            safe_remove_complete(store, old_name)
+        return len(victims)
+
+    if dialect == 'smb1':
+        with SMB_LOCK:
+            with open_chunk_store(cfg, 'smb1') as store:
+                return work(store)
+    with open_chunk_store(cfg, 'smb2') as store:
+        return work(store)
+
+
 def scheduled_backup_runner(app_ids, storage, names, schedule_id):
     try:
-        backup_worker(app_ids, storage, names)
+        backup_worker(app_ids, storage, names, schedule_id=schedule_id)
         with BACKUP_STATE_GUARD:
             result = BACKUP_STATE['status']
             message = BACKUP_STATE['message']
-        schedule_result(schedule_id, ('Zakończono: ' if result == 'success' else 'Błąd: ') + message[:240])
+            warning = BACKUP_STATE.get('retention_warning')
+        schedule_result(schedule_id, ('Zakończono: ' if result == 'success' else 'Błąd: ') +
+                        (warning or message)[:240])
     except BaseException as exc:
         schedule_result(schedule_id, 'Błąd zadania: ' + str(exc)[:240])
         raise
@@ -2234,7 +2332,10 @@ def updates_start():
 
 HTML = r'''<!doctype html>
 <html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>YunoHost Backup Manager</title><style>
+<title>YunoHost Backup Manager</title><script>
+try{document.documentElement.dataset.theme=localStorage.getItem('ybm-theme')||
+ (matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}catch(e){document.documentElement.dataset.theme='light'}
+</script><style>
 *{box-sizing:border-box}body{margin:0;background:#f1f3f7;color:#26354b;font:15px Arial,sans-serif}
 header{background:#263b58;color:white;padding:22px 32px;font-size:22px;font-weight:bold}
 main{max-width:960px;margin:32px auto;padding:0 18px}.panel{background:white;border-radius:10px;padding:26px;margin-bottom:20px;box-shadow:0 3px 16px #0001}
@@ -2530,6 +2631,54 @@ td button{padding:5px 8px;margin:1px;min-height:28px;font-size:11.5px}
  .report-dialog,.restore-dialog{padding:15px}
 }
 @media(prefers-reduced-motion:reduce){button{transition:none}}
+
+/* 0.5~ynh26 — subtelny motyw ciemny; tylko prezentacja. */
+.topbar-actions{display:flex;align-items:center;gap:9px}
+.theme-toggle{font-size:11px;min-height:28px;padding:5px 9px;background:transparent!important;color:#416484!important;border:1px solid #d5e1ed!important}
+.theme-toggle:hover{background:#eaf0f6!important}
+html[data-theme="dark"]{color-scheme:dark;--line:#344458;--text:#d8e3f2;--muted:#9aaec5;--primary:#659fd1}
+html[data-theme="dark"] body{background:#101925;color:#d8e3f2}
+html[data-theme="dark"] .app-sidebar{background:linear-gradient(160deg,#132135,#0d1727);border-right:1px solid #273750}
+html[data-theme="dark"] .app-workspace{background:#101925}
+html[data-theme="dark"] .workspace-topbar{background:#162234;border-color:#304157;color:#b0c1d5}
+html[data-theme="dark"] .yunohost-home-link{color:#8cc4f1}
+html[data-theme="dark"] .version-pill{background:#26364b;border-color:#3a5066;color:#c2d6ea}
+html[data-theme="dark"] .theme-toggle{color:#d1e1f0!important;border-color:#496079!important}
+html[data-theme="dark"] .theme-toggle:hover{background:#30445c!important}
+html[data-theme="dark"] .page-heading h1,html[data-theme="dark"] .page-heading p,html[data-theme="dark"] .page-eyebrow{color:#d5e1f1}
+html[data-theme="dark"] .page-heading p,html[data-theme="dark"] .page-eyebrow{color:#a6b7cb}
+html[data-theme="dark"] .panel{background:#192738;border-color:#304257;box-shadow:0 2px 9px #0002;color:#dbe6f4}
+html[data-theme="dark"] .panel h2,html[data-theme="dark"] label,html[data-theme="dark"] .backup-chunk-top,html[data-theme="dark"] .backup-chunk-top span{color:#e2ebf8}
+html[data-theme="dark"] input,html[data-theme="dark"] select,html[data-theme="dark"] textarea{background:#101b2a;color:#e3edfa;border-color:#41536a}
+html[data-theme="dark"] input::placeholder,html[data-theme="dark"] textarea::placeholder{color:#869bb2}
+html[data-theme="dark"] button.secondary{background:#293b51;border-color:#435973;color:#dbe9f8}
+html[data-theme="dark"] button.secondary:hover:not(:disabled){background:#38516d;border-color:#56718e}
+html[data-theme="dark"] button.danger{background:#402c35;border-color:#794550;color:#ffb9bb}
+html[data-theme="dark"] button.danger:hover:not(:disabled){background:#57303b;border-color:#a45c63}
+html[data-theme="dark"] .appitem,html[data-theme="dark"] th,html[data-theme="dark"] td,html[data-theme="dark"] .backup-create-panel,html[data-theme="dark"] .restore-app{border-color:#304257}
+html[data-theme="dark"] th{background:#203047;color:#b7cce0}
+html[data-theme="dark"] td{color:#d7e5f4}
+html[data-theme="dark"] small,html[data-theme="dark"] .archive-help,html[data-theme="dark"] .schedule-hint,html[data-theme="dark"] .archive-table .archive-apps,html[data-theme="dark"] .archive-actions .archive-selection{color:#a1b5ca}
+html[data-theme="dark"] .archive-table tbody tr:hover{background:#25394f}
+html[data-theme="dark"] .archive-table .archive-status,html[data-theme="dark"] .chunk-state.verified,html[data-theme="dark"] .chunk-state.reused{color:#83d7ae}
+html[data-theme="dark"] .archive-table .archive-status.bad{color:#f2a7a7}
+html[data-theme="dark"] .schedule-apps,html[data-theme="dark"] .backup-chunk-panel{background:#1b2b3e;border-color:#3c5066}
+html[data-theme="dark"] .backup-chunk-scroll{background:#192738}
+html[data-theme="dark"] .backup-chunk-table th{background:#23354b;color:#c8d8e9}
+html[data-theme="dark"] .backup-folder,html[data-theme="dark"] .backup-folder code{color:#a6c7e7}
+html[data-theme="dark"] .chunk-meter-track,html[data-theme="dark"] .update-track{background:#314258}
+html[data-theme="dark"] .chunk-state.waiting,html[data-theme="dark"] .chunk-state.upload,html[data-theme="dark"] .chunk-state.check,html[data-theme="dark"] .chunk-state.verify{color:#9dc8ee}
+html[data-theme="dark"] #backupLogPanel,html[data-theme="dark"] #updateLogPanel,html[data-theme="dark"] #restoreLogPanel,html[data-theme="dark"] #importLogPanel{border-color:#3b5168}
+html[data-theme="dark"] #backupLogPanel summary,html[data-theme="dark"] #updateLogPanel summary,html[data-theme="dark"] #restoreLogPanel summary,html[data-theme="dark"] #importLogPanel summary,
+html[data-theme="dark"] #updateLogPanel .actions{background:#26384d;color:#cedef0}
+html[data-theme="dark"] .report-dialog,html[data-theme="dark"] .restore-dialog{background:#1b293b;color:#e1ebf7;border-color:#415671}
+html[data-theme="dark"] .report-grid dt,html[data-theme="dark"] .report-hash{color:#a7bed4}
+html[data-theme="dark"] .restore-alert{background:#493d2a;color:#f1d9ab}
+html[data-theme="dark"] .restore-alert.bad,html[data-theme="dark"] .error{background:#4b2a36;color:#f2b9bd}
+html[data-theme="dark"] .ok,html[data-theme="dark"] .schedule-tag{background:#233c38;color:#a0ddba}
+html[data-theme="dark"] .schedule-tag.off{background:#354154;color:#b0c0d0}
+html[data-theme="dark"] code{color:#b1d8fb}
+@media(max-width:720px){.topbar-actions{gap:5px}.theme-toggle{font-size:10.5px;padding:5px 6px}}
 </style></head><body>
 <div class="app-shell">
 <aside class="app-sidebar" aria-label="Menu aplikacji">
@@ -2551,7 +2700,7 @@ td button{padding:5px 8px;margin:1px;min-height:28px;font-size:11.5px}
   </div>
 </aside>
 <div class="app-workspace">
-  <header class="workspace-topbar"><nav aria-label="Ścieżka nawigacji"><a class="yunohost-home-link" href="/yunohost/admin/" title="Powrót do panelu administracyjnego YunoHost">YunoHost</a><span class="crumb-divider">/</span><span aria-current="page">Backup Manager</span></nav><span class="version-pill">v{{ app_version }}</span></header>
+  <header class="workspace-topbar"><nav aria-label="Ścieżka nawigacji"><a class="yunohost-home-link" href="/yunohost/admin/" title="Powrót do panelu administracyjnego YunoHost">YunoHost</a><span class="crumb-divider">/</span><span aria-current="page">Backup Manager</span></nav><div class="topbar-actions"><button type="button" id="themeToggle" class="theme-toggle" aria-label="Przełącz jasny i ciemny motyw" title="Zmień motyw">Ciemny motyw</button><span class="version-pill">v{{ app_version }}</span></div></header>
   <main class="workspace-content" id="mainContent">
     <div class="page-heading"><span class="page-eyebrow">PANEL ZARZĄDZANIA</span><h1 id="viewTitle">Kopie zapasowe</h1><p id="viewDescription">Przeglądaj archiwa z magazynu, twórz nowe kopie i przywracaj wybrane aplikacje.</p></div>
     <div class="category-view" id="view-magazyn" data-category="magazyn">
@@ -2650,7 +2799,7 @@ td button{padding:5px 8px;margin:1px;min-height:28px;font-size:11.5px}
     <div class="category-view" id="view-harmonogram" data-category="harmonogram" hidden>
       <section class="panel"><h2>Harmonogram kopii zapasowych</h2>
         <p class="schedule-hint">Zadania wykonują się automatycznie według pięciopolowego zapisu cron w lokalnej strefie czasowej serwera. Używają tych samych magazynów, kontroli SHA256 i logu co kopia ręczna. Jeśli trwa inna operacja, dany termin zostanie pominięty. Wtyczka nie modyfikuje systemowego crontaba.</p>
-        <div class="tablewrap"><table class="schedule-table"><thead><tr><th>Nazwa</th><th>Magazyn</th><th>Cron</th><th>Następne uruchomienie</th><th>Stan</th><th>Ostatni wynik</th><th>Akcje</th></tr></thead><tbody id="scheduleRows"><tr><td colspan="7">Ładowanie harmonogramów…</td></tr></tbody></table></div>
+        <div class="tablewrap"><table class="schedule-table"><thead><tr><th>Nazwa</th><th>Magazyn</th><th>Cron</th><th>Zachowaj</th><th>Następne uruchomienie</th><th>Stan</th><th>Ostatni wynik</th><th>Akcje</th></tr></thead><tbody id="scheduleRows"><tr><td colspan="8">Ładowanie harmonogramów…</td></tr></tbody></table></div>
       </section>
       <section class="panel"><h2 id="scheduleFormTitle">Dodaj harmonogram</h2>
         <form id="scheduleForm"><div class="schedule-form-grid">
@@ -2658,6 +2807,7 @@ td button{padding:5px 8px;margin:1px;min-height:28px;font-size:11.5px}
           <div><label for="scheduleStorage">Magazyn docelowy</label><select id="scheduleStorage" required><option value="">Wybierz magazyn</option></select></div>
           <div><label for="schedulePreset">Częstotliwość</label><select id="schedulePreset"><option value="0 2 * * *">Codziennie o 02:00</option><option value="0 2 * * 0">Co niedzielę o 02:00</option><option value="0 2 * * 1">Co poniedziałek o 02:00</option><option value="0 2 1 * *">Pierwszego dnia miesiąca o 02:00</option><option value="custom">Własny zapis cron</option></select></div>
           <div><label for="scheduleCron">Wyrażenie cron (min godz dzień miesiąc dzień tyg.)</label><input id="scheduleCron" value="0 2 * * *" maxlength="120" spellcheck="false" required><p class="schedule-hint">Przykład: <code>30 3 * * 1-5</code> — od poniedziałku do piątku o 03:30.</p></div>
+          <div><label for="scheduleKeepCount">Zachowaj ostatnie kopie na SMB</label><input id="scheduleKeepCount" type="number" min="0" max="365" step="1" value="0" required><p class="schedule-hint">0 = bez limitu. Po udanej kopii najstarsze archiwa <strong>tego harmonogramu</strong> zostaną automatycznie usunięte. Ręczne kopie pozostają bez zmian.</p></div>
         </div><label>Aplikacje objęte kopią</label><div class="schedule-apps" id="scheduleApps">Ładowanie aplikacji…</div>
         <label class="appitem"><input type="checkbox" id="scheduleEnabled" checked><span>Harmonogram włączony</span></label>
         <div class="actions"><button type="submit" id="scheduleSave">Zapisz harmonogram</button><button type="button" class="secondary" id="scheduleCancel" hidden>Anuluj edycję</button><button type="button" class="secondary" id="scheduleRefresh">Odśwież</button></div></form>
@@ -2683,6 +2833,9 @@ td button{padding:5px 8px;margin:1px;min-height:28px;font-size:11.5px}
 </div>
 </div><script>
 const $=id=>document.getElementById(id);let editing=null;let records=[];
+function syncThemeToggle(){const dark=document.documentElement.dataset.theme==='dark';$('themeToggle').textContent=dark?'Jasny motyw':'Ciemny motyw';$('themeToggle').setAttribute('aria-pressed',String(dark))}
+$('themeToggle').addEventListener('click',()=>{const dark=document.documentElement.dataset.theme==='dark';document.documentElement.dataset.theme=dark?'light':'dark';try{localStorage.setItem('ybm-theme',document.documentElement.dataset.theme)}catch(e){}syncThemeToggle()});
+syncThemeToggle();
 const categoryDetails={
  magazyn:{title:'Magazyn',description:'Zarządzaj magazynami SMB/CIFS i połączeniami sieciowymi.'},
  kopie:{title:'Kopie zapasowe',description:'Przeglądaj archiwa z magazynu, twórz nowe kopie i przywracaj wybrane aplikacje.'},
@@ -3089,21 +3242,21 @@ function scheduleAppChoices(selected){const host=$('scheduleApps');host.replaceC
  if(!opts.length){host.textContent='Brak aplikacji. Najpierw odśwież listę w zakładce Kopie zapasowe.';return;}
  for(const opt of opts){const wrapper=document.createElement('label');wrapper.className='appitem';const cb=document.createElement('input');cb.type='checkbox';cb.value=opt.value;cb.checked=Boolean(selected&&selected.includes(opt.value));
  const cap=document.createElement('span');cap.textContent=opt.closest('label')?.querySelector('strong')?.textContent||opt.value;wrapper.append(cb,cap);host.append(wrapper);}}
-function scheduleReset(){scheduleEditing='';$('scheduleForm').reset();$('scheduleCron').value='0 2 * * *';$('schedulePreset').value='0 2 * * *';$('scheduleEnabled').checked=true;
+function scheduleReset(){scheduleEditing='';$('scheduleForm').reset();$('scheduleCron').value='0 2 * * *';$('schedulePreset').value='0 2 * * *';$('scheduleEnabled').checked=true;$('scheduleKeepCount').value='0';
  $('scheduleFormTitle').textContent='Dodaj harmonogram';$('scheduleCancel').hidden=true;scheduleAppChoices([]);}
 function scheduleEdit(id){const r=scheduleRows.find(s=>s.id===id);if(!r)return;scheduleEditing=id;$('scheduleName').value=r.name;$('scheduleStorage').value=r.storage_id;
- $('scheduleCron').value=r.cron;$('schedulePreset').value=[...$('schedulePreset').options].some(o=>o.value===r.cron)?r.cron:'custom';$('scheduleEnabled').checked=r.enabled;
+ $('scheduleCron').value=r.cron;$('schedulePreset').value=[...$('schedulePreset').options].some(o=>o.value===r.cron)?r.cron:'custom';$('scheduleEnabled').checked=r.enabled;$('scheduleKeepCount').value=r.keep_count??0;
  scheduleAppChoices(r.apps);$('scheduleFormTitle').textContent='Edytuj harmonogram: '+r.name;$('scheduleCancel').hidden=false;$('scheduleForm').scrollIntoView({behavior:'smooth'});}
 async function loadSchedules(){try{const r=await api('/api/schedules');if(!r.success)throw new Error(r.message);scheduleToken=r.csrf;scheduleRows=r.schedules;
- const body=$('scheduleRows');body.replaceChildren();if(!scheduleRows.length){const tr=body.insertRow();const td=tr.insertCell();td.colSpan=7;td.textContent='Brak harmonogramów.';}
- for(const item of scheduleRows){const tr=body.insertRow();for(const value of [item.name,item.storage_id,item.cron,item.next_run||'—'])tr.insertCell().textContent=value;
+ const body=$('scheduleRows');body.replaceChildren();if(!scheduleRows.length){const tr=body.insertRow();const td=tr.insertCell();td.colSpan=8;td.textContent='Brak harmonogramów.';}
+ for(const item of scheduleRows){const tr=body.insertRow();for(const value of [item.name,item.storage_id,item.cron,item.keep_count?String(item.keep_count):'Bez limitu',item.next_run||'—'])tr.insertCell().textContent=value;
  const status=tr.insertCell(),badge=document.createElement('span');badge.className='schedule-tag'+(item.enabled?'':' off');badge.textContent=item.enabled?'Włączony':'Wyłączony';status.append(badge);
  tr.insertCell().textContent=(item.last_run?item.last_run+' — ':'')+(item.last_result||'Nie uruchomiono');const action=tr.insertCell();action.className='schedule-grid-actions';
  for(const [name,cb,bad] of [['Edytuj',()=>scheduleEdit(item.id),false],[item.enabled?'Wyłącz':'Włącz',()=>scheduleToggle(item),false],['Usuń',()=>scheduleRemove(item),true]]){
  const button=document.createElement('button');button.type='button';button.textContent=name;button.className=bad?'danger':'secondary';button.onclick=cb;action.append(button)}}
  }catch(e){scheduleNotice(false,'Nie udało się pobrać harmonogramów: '+e.message)}}
 async function scheduleWrite(url,method,body){const root=window.location.pathname.replace(/\/$/,'');const resp=await fetch(root+url,{method,headers:{'Content-Type':'application/json','X-Schedule-CSRF':scheduleToken},body:JSON.stringify(body)});return await resp.json();}
-async function scheduleToggle(item){try{const r=await scheduleWrite('/api/schedules/'+encodeURIComponent(item.id),'PUT',{name:item.name,cron:item.cron,storage:item.storage_id,apps:item.apps,enabled:!item.enabled});
+async function scheduleToggle(item){try{const r=await scheduleWrite('/api/schedules/'+encodeURIComponent(item.id),'PUT',{name:item.name,cron:item.cron,storage:item.storage_id,apps:item.apps,enabled:!item.enabled,keep_count:item.keep_count??0});
  scheduleNotice(Boolean(r.success),r.message);if(r.success)await loadSchedules();}catch(e){scheduleNotice(false,e.message)}}
 async function scheduleRemove(item){if(!confirm('Usunąć harmonogram "'+item.name+'"? Archiwa pozostaną na magazynie.'))return;
  try{const r=await scheduleWrite('/api/schedules/'+encodeURIComponent(item.id),'DELETE',{});scheduleNotice(Boolean(r.success),r.message);if(r.success){if(scheduleEditing===item.id)scheduleReset();await loadSchedules();}}catch(e){scheduleNotice(false,e.message)}}
@@ -3113,7 +3266,7 @@ $('scheduleCancel').onclick=()=>scheduleReset();$('scheduleRefresh').onclick=loa
 $('scheduleForm').addEventListener('submit',async event=>{event.preventDefault();const apps=[...$('scheduleApps').querySelectorAll('input:checked')].map(x=>x.value);
  if(!apps.length){scheduleNotice(false,'Wybierz co najmniej jedną aplikację.');return}
  const btn=$('scheduleSave');btn.disabled=true;
- try{const payload={name:$('scheduleName').value,cron:$('scheduleCron').value,storage:$('scheduleStorage').value,apps,enabled:$('scheduleEnabled').checked};
+ try{const payload={name:$('scheduleName').value,cron:$('scheduleCron').value,storage:$('scheduleStorage').value,apps,enabled:$('scheduleEnabled').checked,keep_count:Number($('scheduleKeepCount').value)};
  const url=scheduleEditing?'/api/schedules/'+encodeURIComponent(scheduleEditing):'/api/schedules';const r=await scheduleWrite(url,scheduleEditing?'PUT':'POST',payload);
  scheduleNotice(Boolean(r.success),r.message);if(r.success){scheduleReset();await loadSchedules();}
  }catch(e){scheduleNotice(false,e.message)}finally{btn.disabled=false}});
